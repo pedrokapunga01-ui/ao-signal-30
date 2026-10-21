@@ -1,12 +1,10 @@
 'use strict';
 
-import pg from 'pg';
-
-const { Pool } = pg;
+const { Pool } = require('pg');
 
 let pool = null;
 
-export function getSql() {
+function getSql() {
   if (!pool) {
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error('DATABASE_URL não definida');
@@ -22,9 +20,11 @@ export function getSql() {
   return pool;
 }
 
-export async function closeDb() {
+async function closeDb() {
   if (pool) {
     await pool.end();
     pool = null;
   }
 }
+
+module.exports = { getSql, closeDb };
