@@ -1,7 +1,7 @@
 {
-  "name": "capunga-dados-bacbo",
-  "version": "2.0.0",
-  "description": "Robô de sinais Bac Bo multi-estratégia",
+  "name": "capunga-dados-horario-fixo",
+  "version": "3.0.0",
+  "description": "Capunga Dados - Sinais Bac Bo a cada 4 minutos",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
