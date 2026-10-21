@@ -1,7 +1,7 @@
 {
-  "name": "capunga-dados-horario-fixo",
-  "version": "3.1.0",
-  "description": "Capunga Dados - Sinais a cada 4 minutos (estável)",
+  "name": "capunga-dados-bacbo",
+  "version": "4.0.0",
+  "description": "Capunga Dados Bac Bo - Multi estratégia estável",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
