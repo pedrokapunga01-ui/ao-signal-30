@@ -1,15 +1,15 @@
 'use strict';
 
-import axios from 'axios';
+const axios = require('axios');
 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 
-export function telegramConfigurado() {
+function telegramConfigurado() {
   return Boolean(BOT_TOKEN && CHAT_ID);
 }
 
-export async function enviar(texto) {
+async function enviar(texto) {
   if (!telegramConfigurado()) return false;
 
   try {
@@ -29,7 +29,7 @@ export async function enviar(texto) {
   }
 }
 
-export function horaAngola() {
+function horaAngola() {
   return new Intl.DateTimeFormat('pt-PT', {
     timeZone: 'Africa/Luanda',
     dateStyle: 'short',
@@ -38,8 +38,10 @@ export function horaAngola() {
   }).format(new Date());
 }
 
-export function corDisplay(cor) {
+function corDisplay(cor) {
   if (cor === 'Banca') return '🔴 BANCA';
   if (cor === 'Jogador') return '🔵 JOGADOR';
   return cor;
 }
+
+module.exports = { telegramConfigurado, enviar, horaAngola, corDisplay };
