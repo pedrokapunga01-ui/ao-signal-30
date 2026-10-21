@@ -1,6 +1,6 @@
 {
   "name": "capunga-dados-bacbo",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "Capunga Dados Bac Bo - Multi estratégia estável",
   "main": "server.js",
   "scripts": {
