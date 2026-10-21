@@ -5,11 +5,11 @@
  * CAPUNGA DADOS — BAC BO
  * Node.js + Express + PostgreSQL + Telegram
  *
- * Agenda: minutos 00, 05, 10, ..., 55.
+ * Agendamento: de 5 em 5 minutos.
  * Gale máximo: 2.
- * Empate: devolve/push, mantém a tentativa atual.
+ * Empate: devolução; mantém o Gale.
  *
- * Variáveis obrigatórias:
+ * Variáveis obrigatórias no Render:
  * DATABASE_URL
  * BOT_TOKEN
  * CHAT_ID
@@ -41,7 +41,8 @@ const CHAT_ID = process.env.CHAT_ID || '';
 const INGEST_TOKEN = process.env.INGEST_TOKEN || '';
 
 const MIN_AMOSTRA = Math.max(
-  10, Math.min(500, Number(process.env.MIN_AMOSTRA || 20))
+  10,
+  Math.min(500, Number(process.env.MIN_AMOSTRA || 20))
 );
 
 const JANELA_ANALISE = Math.max(
@@ -72,6 +73,10 @@ let server;
 let timer;
 let encerrando = false;
 let cicloEmCurso = false;
+
+/* =================================================
+   HORÁRIO
+================================================= */
 
 function horaLocal(data = new Date()) {
   return new Intl.DateTimeFormat('pt-AO', {
@@ -104,17 +109,20 @@ function chaveHorario(data = new Date()) {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
+function registarErro(erro) {
+  runtime.ultimoErro = erro?.message || String(erro);
+  console.error('[ERRO]', runtime.ultimoErro);
+}
+
 function proximoHorario() {
-  const agora = Date.now();
   const passo = 5 * 60 * 1000;
-  return Math.floor(agora / passo + 1) * passo;
+  return Math.floor(Date.now() / passo + 1) * passo;
 }
 
 function esperarProximoHorario() {
   if (encerrando) return;
 
   const proximo = proximoHorario();
-  const atraso = Math.max(250, proximo - Date.now());
 
   timer = setTimeout(async () => {
     try {
@@ -124,13 +132,12 @@ function esperarProximoHorario() {
     } finally {
       esperarProximoHorario();
     }
-  }, atraso);
+  }, Math.max(250, proximo - Date.now()));
 }
 
-function registarErro(erro) {
-  runtime.ultimoErro = erro.message || String(erro);
-  console.error('[ERRO]', runtime.ultimoErro);
-}
+/* =================================================
+   TELEGRAM
+================================================= */
 
 async function telegram(mensagem) {
   if (!BOT_TOKEN || !CHAT_ID) {
@@ -162,11 +169,14 @@ async function telegram(mensagem) {
   return true;
 }
 
-/* ================================================
-   BASE DE DADOS
-================================================ */
+/* =================================================
+   BASE DE DADOS — CRIAÇÃO E MIGRAÇÃO
+================================================= */
 
 async function prepararBase() {
+  /*
+   * Criar as tabelas caso ainda não existam.
+   */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bacbo_resultados (
       id BIGSERIAL PRIMARY KEY,
@@ -179,16 +189,39 @@ async function prepararBase() {
     CREATE TABLE IF NOT EXISTS bacbo_sinais (
       id BIGSERIAL PRIMARY KEY,
       horario TEXT NOT NULL UNIQUE,
-      cor TEXT NOT NULL CHECK (cor IN ('RED', 'BLUE')),
+      cor TEXT NOT NULL
+        CHECK (cor IN ('RED', 'BLUE')),
       gale INTEGER NOT NULL DEFAULT 0,
       estado TEXT NOT NULL DEFAULT 'ABERTO'
-        CHECK (estado IN ('ABERTO', 'GREEN', 'LOSS', 'CANCELADO')),
+        CHECK (
+          estado IN ('ABERTO', 'GREEN', 'LOSS', 'CANCELADO')
+        ),
       frequencia NUMERIC(6,4),
       amostra INTEGER NOT NULL DEFAULT 0,
       criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       fechado_em TIMESTAMPTZ
     );
+  `);
 
+  /*
+   * CORREÇÃO PRINCIPAL:
+   * CREATE TABLE IF NOT EXISTS não atualiza tabelas antigas.
+   * Adicionar as colunas em falta sem apagar os dados.
+   */
+  await pool.query(`
+    ALTER TABLE bacbo_resultados
+      ADD COLUMN IF NOT EXISTS criado_em
+      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    ALTER TABLE bacbo_sinais
+      ADD COLUMN IF NOT EXISTS criado_em
+      TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
+
+  /*
+   * Índices criados depois da migração das colunas.
+   */
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_resultados_data
       ON bacbo_resultados (criado_em DESC);
 
@@ -197,12 +230,12 @@ async function prepararBase() {
   `);
 
   runtime.baseDadosOK = true;
-  console.log('[DB] Tabelas verificadas');
+  console.log('[DB] Tabelas e colunas verificadas');
 }
 
-/* ================================================
-   ANÁLISE ESTATÍSTICA SIMPLES
-================================================ */
+/* =================================================
+   ANÁLISE ESTATÍSTICA
+================================================= */
 
 async function analisarHistorico() {
   const resultado = await pool.query(
@@ -249,82 +282,9 @@ async function analisarHistorico() {
   };
 }
 
-/* ================================================
-   LIQUIDAÇÃO DE SINAIS
-================================================ */
-
-async function liquidarResultado(resultado) {
-  const aberto = await pool.query(
-    `SELECT *
-     FROM bacbo_sinais
-     WHERE estado = 'ABERTO'
-     ORDER BY id ASC
-     LIMIT 1
-     FOR UPDATE`
-  );
-
-  if (!aberto.rows.length) return null;
-
-  const sinal = aberto.rows[0];
-
-  // Empate: devolve; não avança o Gale.
-  if (resultado === 'TIE') {
-    return {
-      tipo: 'TIE',
-      sinal,
-      gale: sinal.gale
-    };
-  }
-
-  if (resultado === sinal.cor) {
-    await pool.query(
-      `UPDATE bacbo_sinais
-       SET estado = 'GREEN', fechado_em = NOW()
-       WHERE id = $1`,
-      [sinal.id]
-    );
-
-    return {
-      tipo: 'GREEN',
-      sinal,
-      gale: sinal.gale
-    };
-  }
-
-  if (sinal.gale < 2) {
-    const proximoGale = sinal.gale + 1;
-
-    await pool.query(
-      `UPDATE bacbo_sinais
-       SET gale = $2
-       WHERE id = $1`,
-      [sinal.id, proximoGale]
-    );
-
-    return {
-      tipo: 'GALE',
-      sinal: { ...sinal, gale: proximoGale },
-      gale: proximoGale
-    };
-  }
-
-  await pool.query(
-    `UPDATE bacbo_sinais
-     SET estado = 'LOSS', fechado_em = NOW()
-     WHERE id = $1`,
-    [sinal.id]
-  );
-
-  return {
-    tipo: 'LOSS',
-    sinal,
-    gale: 2
-  };
-}
-
-/* ================================================
-   RECEÇÃO DE RESULTADOS REAIS
-================================================ */
+/* =================================================
+   RECEÇÃO E LIQUIDAÇÃO DOS RESULTADOS
+================================================= */
 
 app.post('/api/result', async (req, res) => {
   if (!INGEST_TOKEN) {
@@ -334,8 +294,9 @@ app.post('/api/result', async (req, res) => {
     });
   }
 
-  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
-    || req.body.token;
+  const token =
+    req.headers.authorization?.replace(/^Bearer\s+/i, '') ||
+    req.body.token;
 
   if (token !== INGEST_TOKEN) {
     return res.status(401).json({
@@ -355,9 +316,10 @@ app.post('/api/result', async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
 
     await client.query(
@@ -366,7 +328,6 @@ app.post('/api/result', async (req, res) => {
       [resultado]
     );
 
-    // Bloqueia liquidações concorrentes.
     const abertos = await client.query(
       `SELECT *
        FROM bacbo_sinais
@@ -382,20 +343,31 @@ app.post('/api/result', async (req, res) => {
       const sinal = abertos.rows[0];
 
       if (resultado === 'TIE') {
-        liquidacao = { tipo: 'TIE', sinal };
+        // Empate: devolução, sem avançar o Gale.
+        liquidacao = {
+          tipo: 'TIE',
+          sinal
+        };
       } else if (resultado === sinal.cor) {
         await client.query(
           `UPDATE bacbo_sinais
-           SET estado = 'GREEN', fechado_em = NOW()
+           SET estado = 'GREEN',
+               fechado_em = NOW()
            WHERE id = $1`,
           [sinal.id]
         );
-        liquidacao = { tipo: 'GREEN', sinal };
+
+        liquidacao = {
+          tipo: 'GREEN',
+          sinal
+        };
       } else if (sinal.gale < 2) {
         const gale = sinal.gale + 1;
 
         await client.query(
-          `UPDATE bacbo_sinais SET gale = $2 WHERE id = $1`,
+          `UPDATE bacbo_sinais
+           SET gale = $2
+           WHERE id = $1`,
           [sinal.id, gale]
         );
 
@@ -406,11 +378,16 @@ app.post('/api/result', async (req, res) => {
       } else {
         await client.query(
           `UPDATE bacbo_sinais
-           SET estado = 'LOSS', fechado_em = NOW()
+           SET estado = 'LOSS',
+               fechado_em = NOW()
            WHERE id = $1`,
           [sinal.id]
         );
-        liquidacao = { tipo: 'LOSS', sinal };
+
+        liquidacao = {
+          tipo: 'LOSS',
+          sinal
+        };
       }
     }
 
@@ -418,45 +395,65 @@ app.post('/api/result', async (req, res) => {
 
     runtime.ultimaSincronizacao = new Date().toISOString();
 
-    if (liquidacao) {
-      const s = liquidacao.sinal;
-      let mensagem;
-
-      if (liquidacao.tipo === 'GREEN') {
-        mensagem = `✅ GREEN — CAPUNGA DADOS\nSinal: ${s.cor}\nResolvido no Gale ${s.gale}.`;
-      } else if (liquidacao.tipo === 'GALE') {
-        mensagem = `⚠️ GALE ${s.gale}\nSinal original: ${s.cor}\nAguardar o próximo resultado real.`;
-      } else if (liquidacao.tipo === 'LOSS') {
-        mensagem = `❌ LOSS\nSinal original: ${s.cor}\nGale máximo 2 atingido.`;
-      } else {
-        mensagem = `➖ EMPATE / DEVOLUÇÃO\nSinal: ${s.cor}\nManter a tentativa Gale ${s.gale}.`;
-      }
-
-      telegram(mensagem).catch(registarErro);
-    }
-
     res.json({
       sucesso: true,
       resultado,
       liquidacao: liquidacao?.tipo || 'SEM_SINAL_ABERTO',
       hora: horaLocal()
     });
+
+    /*
+     * Enviar notificações depois de confirmar a transação.
+     */
+    if (liquidacao) {
+      const s = liquidacao.sinal;
+      let mensagem;
+
+      if (liquidacao.tipo === 'GREEN') {
+        mensagem =
+          `✅ GREEN — CAPUNGA DADOS\n` +
+          `Sinal: ${s.cor}\n` +
+          `Resolvido no Gale ${s.gale}.`;
+      } else if (liquidacao.tipo === 'GALE') {
+        mensagem =
+          `⚠️ GALE ${s.gale}\n` +
+          `Sinal original: ${s.cor}\n` +
+          `Aguardar o próximo resultado real.`;
+      } else if (liquidacao.tipo === 'LOSS') {
+        mensagem =
+          `❌ LOSS\n` +
+          `Sinal original: ${s.cor}\n` +
+          `Gale máximo 2 atingido.`;
+      } else {
+        mensagem =
+          `➖ EMPATE / DEVOLUÇÃO\n` +
+          `Sinal: ${s.cor}\n` +
+          `Manter a tentativa Gale ${s.gale}.`;
+      }
+
+      telegram(mensagem).catch(registarErro);
+    }
   } catch (erro) {
-    await client.query('ROLLBACK').catch(() => {});
+    if (client) {
+      await client.query('ROLLBACK').catch(() => {});
+    }
+
     registarErro(erro);
 
-    res.status(500).json({
-      sucesso: false,
-      erro: 'Falha ao guardar o resultado'
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        sucesso: false,
+        erro: 'Falha ao guardar o resultado'
+      });
+    }
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
-/* ================================================
-   AGENDAMENTO DE 5 EM 5 MINUTOS
-================================================ */
+/* =================================================
+   AGENDAMENTO
+================================================= */
 
 async function executarAgendamento() {
   if (encerrando || cicloEmCurso) return;
@@ -467,28 +464,38 @@ async function executarAgendamento() {
     const horario = chaveHorario();
 
     if (runtime.ultimoAgendamento === horario) return;
+
     runtime.ultimoAgendamento = horario;
     runtime.ciclos++;
 
     const aberto = await pool.query(
-      `SELECT id FROM bacbo_sinais
+      `SELECT id
+       FROM bacbo_sinais
        WHERE estado = 'ABERTO'
        LIMIT 1`
     );
 
     if (aberto.rows.length) {
-      console.log('[AGENDA] Existe sinal aberto; novo sinal ignorado.');
+      console.log(
+        '[AGENDA] Existe sinal aberto; novo sinal ignorado.'
+      );
       return;
     }
 
     const analise = await analisarHistorico();
 
     if (!analise.aprovado) {
-      console.log('[SEM SINAL]', analise.motivo, analise.amostra);
+      console.log(
+        '[SEM SINAL]',
+        analise.motivo,
+        analise.amostra
+      );
       return;
     }
 
-    const frequencia = Number(analise.frequencia.toFixed(4));
+    const frequencia = Number(
+      analise.frequencia.toFixed(4)
+    );
 
     const inserido = await pool.query(
       `INSERT INTO bacbo_sinais
@@ -496,7 +503,12 @@ async function executarAgendamento() {
        VALUES ($1, $2, 0, 'ABERTO', $3, $4)
        ON CONFLICT (horario) DO NOTHING
        RETURNING *`,
-      [horario, analise.cor, frequencia, analise.amostra]
+      [
+        horario,
+        analise.cor,
+        frequencia,
+        analise.amostra
+      ]
     );
 
     if (!inserido.rows.length) return;
@@ -510,13 +522,21 @@ async function executarAgendamento() {
       `🎯 Sinal: ${sinal.cor}\n` +
       `🔁 Gale máximo: 2\n` +
       `➖ Empate: devolve\n` +
-      `📊 Frequência histórica: ${(frequencia * 100).toFixed(1)}%\n` +
+      `📊 Frequência histórica: ` +
+      `${(frequencia * 100).toFixed(1)}%\n` +
       `📚 Amostra: ${analise.amostra} resultados\n\n` +
       `⚠️ Frequência passada não garante o próximo resultado.`;
 
-    await telegram(mensagem);
-
-    console.log('[SINAL]', horario, sinal.cor);
+    try {
+      await telegram(mensagem);
+      console.log('[SINAL]', horario, sinal.cor);
+    } catch (erro) {
+      /*
+       * O sinal já foi gravado. Um erro no Telegram não
+       * deve terminar o servidor nem apagar o registo.
+       */
+      registarErro(erro);
+    }
   } catch (erro) {
     registarErro(erro);
   } finally {
@@ -524,9 +544,9 @@ async function executarAgendamento() {
   }
 }
 
-/* ================================================
-   ROTAS DE ESTADO
-================================================ */
+/* =================================================
+   ROTAS HTTP
+================================================= */
 
 app.get('/', (_req, res) => {
   res.json({
@@ -575,6 +595,7 @@ app.get('/status', async (_req, res) => {
     });
   } catch (erro) {
     registarErro(erro);
+
     res.status(500).json({
       sucesso: false,
       erro: 'Falha ao consultar estado'
@@ -585,8 +606,10 @@ app.get('/status', async (_req, res) => {
 app.get('/api/painel', async (_req, res) => {
   try {
     const sinais = await pool.query(
-      `SELECT * FROM bacbo_sinais
-       ORDER BY id DESC LIMIT 50`
+      `SELECT *
+       FROM bacbo_sinais
+       ORDER BY id DESC
+       LIMIT 50`
     );
 
     res.json({
@@ -596,13 +619,17 @@ app.get('/api/painel', async (_req, res) => {
     });
   } catch (erro) {
     registarErro(erro);
-    res.status(500).json({ sucesso: false });
+
+    res.status(500).json({
+      sucesso: false,
+      erro: 'Falha ao consultar sinais'
+    });
   }
 });
 
-/* ================================================
-   ARRANQUE E ENCERRAMENTO
-================================================ */
+/* =================================================
+   ARRANQUE
+================================================= */
 
 async function iniciar() {
   if (!DATABASE_URL) {
@@ -610,11 +637,15 @@ async function iniciar() {
   }
 
   if (!BOT_TOKEN || !CHAT_ID) {
-    throw new Error('Configura BOT_TOKEN e CHAT_ID no Render.');
+    throw new Error(
+      'Configura BOT_TOKEN e CHAT_ID no Render.'
+    );
   }
 
   if (!INGEST_TOKEN) {
-    throw new Error('Configura INGEST_TOKEN no Render.');
+    throw new Error(
+      'Configura INGEST_TOKEN no Render.'
+    );
   }
 
   pool = new Pool({
@@ -635,14 +666,21 @@ async function iniciar() {
 
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[HTTP] Porta ${PORT}`);
-    console.log(`[AGENDA] De 5 em 5 minutos — ${TIME_ZONE}`);
+    console.log(
+      `[AGENDA] De 5 em 5 minutos — ${TIME_ZONE}`
+    );
   });
 
   esperarProximoHorario();
 }
 
+/* =================================================
+   ENCERRAMENTO SEGURO
+================================================= */
+
 async function encerrar() {
   if (encerrando) return;
+
   encerrando = true;
 
   if (timer) clearTimeout(timer);
