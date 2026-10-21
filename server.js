@@ -1,4 +1,3 @@
-JavaScript
 'use strict';
 
 /**
