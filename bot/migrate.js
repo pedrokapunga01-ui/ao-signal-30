@@ -1,8 +1,8 @@
 'use strict';
 
-import { getSql } from './db.js';
+const { getSql } = require('./db');
 
-export async function migrate() {
+async function migrate() {
   const sql = getSql();
 
   await sql.query(`
@@ -36,3 +36,5 @@ export async function migrate() {
   await sql.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON bacbo_sinais (estado)`);
   await sql.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON bacbo_sinais (criado_em DESC)`);
 }
+
+module.exports = { migrate };
