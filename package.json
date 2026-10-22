@@ -1,7 +1,7 @@
 {
 "name": "dados-ao-bacbo-signal-bot",
 "version": "1.0.0",
-"description": "Servidor do robô de sinais Bac Bo do Dados AO",
+"description": "Servidor do robô Telegram do Dados AO",
 "main": "server.js",
 "type": "commonjs",
 "scripts": {
