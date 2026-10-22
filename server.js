@@ -1,139 +1,179 @@
 'use strict';
 
+/**
+ * CAPUNGA DADOS — BAC BO TELEGRAM SERVER (v5 - endurecido)
+ *
+ * - Não inventa sinais para cumprir frequência
+ * - Não bloqueia por limite diário de REDs
+ * - Na primeira sincronização importa histórico sem publicar sinais antigos
+ * - Só resolve sinais com rodadas novas
+ * - Análise de padrões é descritiva
+ *
+ * Variáveis obrigatórias:
+ *   DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
+ *
+ * Opcionais:
+ *   API_BACBO, SINAIS_ATIVOS, STREAK_MIN, MAX_GALE,
+ *   EMPATE_PROTEGIDO, INTERVALO_MINIMO_MS, SINAL_EXPIRA_MIN,
+ *   INTERVALO_SYNC_MS, TELEGRAM_PARSE_MODE, ALERT_WEBHOOK
+ */
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
-const crypto = require('crypto');
 
 const app = express();
-
 app.disable('x-powered-by');
-app.use(express.json({ limit: '32kb' }));
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
 const PORT = Number(process.env.PORT || 10000);
-const API_BACBO = process.env.API_BACBO ||
-  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
-
-const INTERVALO_SYNC_MS = Math.min(
-  60000,
-  Math.max(
-    5000,
-    Number.parseInt(process.env.INTERVALO_SYNC_MS || '8000', 10) || 8000
-  )
-);
-
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-const TELEGRAM_NOTIFY_NEW_RESULT =
-  process.env.TELEGRAM_NOTIFY_NEW_RESULT === 'true';
+const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || '';
+const API_BACBO = process.env.API_BACBO ||
+  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
 
-if (!process.env.DATABASE_URL) {
-  console.error('[FATAL] DATABASE_URL não configurada.');
-  process.exit(1);
+function boolEnv(value, fallback = false) {
+  if (value === undefined || value === '') return fallback;
+  return ['true', '1', 'yes', 'sim', 'on'].includes(String(value).trim().toLowerCase());
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL)
-    ? false
-    : { rejectUnauthorized: false },
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-  statement_timeout: 15000
-});
+function intEnv(name, fallback, min, max) {
+  const n = Number.parseInt(process.env[name], 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
 
-pool.on('error', err => {
-  console.error('[DB_POOL]', err.message);
-});
-
-const runtime = {
-  iniciadoEm: new Date().toISOString(),
-  ultimaSincronizacao: null,
-  ultimaSincronizacaoBemSucedida: null,
-  ultimoResultadoNovoEm: null,
-  ultimoId: null,
-  apiHttp: null,
-  apiLatenciaMs: null,
-  erroAPI: null,
-  erroDB: null,
-  ultimaMensagemTelegram: null,
-  erroTelegram: null,
-  itensBrutos: 0,
-  itensNormalizados: 0,
-  itensDescartados: 0,
-  novos: 0,
-  atualizados: 0,
-  inalterados: 0,
-  ciclosSemNovos: 0,
-  duracaoMs: null,
-  sincronizacaoEmCurso: false,
-  formatoResposta: null,
-  falhasConsecutivas: 0
+const CONFIG = {
+  sinaisAtivos: boolEnv(process.env.SINAIS_ATIVOS, true),
+  streakMin: intEnv('STREAK_MIN', 3, 2, 12),
+  maxGale: intEnv('MAX_GALE', 2, 0, 3),
+  empateProtegido: boolEnv(process.env.EMPATE_PROTEGIDO, true),
+  intervaloMinimoMs: intEnv('INTERVALO_MINIMO_MS', 45000, 0, 3600000), // \~45s entre sinais (frequência média)
+  sinalExpiraMin: intEnv('SINAL_EXPIRA_MIN', 12, 3, 180),
+  intervaloSyncMs: intEnv('INTERVALO_SYNC_MS', 7000, 5000, 30000),
+  telegramParseMode: process.env.TELEGRAM_PARSE_MODE || ''
 };
 
-let server;
-let timer;
-let stopping = false;
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL)
+        ? false
+        : { rejectUnauthorized: false },
+      max: 8,
+      idleTimeoutMillis: 20000,
+      connectionTimeoutMillis: 12000
+    })
+  : null;
 
-function nowAngola() {
-  return new Date().toLocaleString('pt-PT', {
-    timeZone: 'Africa/Luanda'
+if (pool) {
+  pool.on('error', (err) => {
+    log('POOL_ERROR', err.message);
+    runtime.erroSincronizacao = err.message;
   });
 }
 
-function safeError(err) {
-  return {
-    mensagem: String(err?.message || err).slice(0, 400),
-    codigo: err?.code || null,
-    http: err?.response?.status || null
-  };
+const runtime = {
+  iniciadoEm: new Date().toISOString(),
+  sincronizacaoEmCurso: false,
+  sincronizacaoInicialConcluida: false,
+  ultimaSincronizacao: null,
+  ultimaRodadaNova: null,
+  ultimoIdNovo: null,
+  ultimaHoraDaAPI: null,
+  quantidadeAPI: 0,
+  itensRecebidosAPI: 0,
+  duplicadosUltimoCiclo: 0,
+  novosUltimoCiclo: 0,
+  erroSincronizacao: null,
+  ultimoSinal: null,
+  ultimaMensagemTelegram: null,
+  ultimoErroTelegram: null,
+  ultimoHTTPAPI: null,
+  ultimoErroAPI: null,
+  ultimaRodadaDB: null,
+  ultimoIdDB: null,
+  ciclosSemNovos: 0,
+  errosConsecutivos: 0,
+  motivoSemSinal: null,
+  ultimaEstrategia: null,
+  ultimaDuracaoSyncMs: null,
+  gapDetectado: null
+};
+
+let schemaPromise = null;
+let server = null;
+let syncTimer = null;
+let shuttingDown = false;
+
+function log(tag, data) {
+  const payload = typeof data === 'string' ? data : JSON.stringify(data);
+  console.log(`[\( {new Date().toISOString()}] [ \){tag}] ${payload}`);
 }
 
-function dateValue(value) {
-  if (value === null || value === undefined || value === '') {
-    return null;
+function horaAngola() {
+  return new Intl.DateTimeFormat('pt-PT', {
+    timeZone: 'Africa/Luanda',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+    hour12: false
+  }).format(new Date());
+}
+
+async function alertIndependent(msg) {
+  log('ALERTA', msg);
+  if (ALERT_WEBHOOK) {
+    try {
+      await axios.post(ALERT_WEBHOOK, {
+        text: `[Capunga BacBo] ${msg}`,
+        time: new Date().toISOString()
+      }, { timeout: 8000 });
+    } catch (e) {
+      log('ALERT_WEBHOOK_FAIL', e.message);
+    }
   }
-
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function firstDefined(...values) {
-  return values.find(
-    value => value !== undefined &&
-      value !== null &&
-      value !== ''
-  );
+function corDisplay(cor) {
+  if (cor === 'Banca') return '🔴 BANCA';
+  if (cor === 'Jogador') return '🔵 JOGADOR';
+  if (cor === 'Empate') return '🟡 EMPATE';
+  return String(cor || 'N/D');
 }
 
-function normalizeOutcome(value) {
-  const text = String(value || '').trim().toLowerCase();
-
-  if ([
-    'jogador', 'player', 'blue', 'playerwin', 'player_win'
-  ].includes(text)) return 'Jogador';
-
-  if ([
-    'banca', 'banker', 'red', 'bankerwin', 'banker_win'
-  ].includes(text)) return 'Banca';
-
-  if ([
-    'empate', 'tie', 'draw', 'egal'
-  ].includes(text)) return 'Empate';
-
+function oposta(cor) {
+  if (cor === 'Banca') return 'Jogador';
+  if (cor === 'Jogador') return 'Banca';
   return null;
 }
 
-function numeric(value) {
-  if (value === null || value === undefined || value === '') {
-    return null;
+function normalizeOutcome(value) {
+  if (value && typeof value === 'object') {
+    value = value.outcome ?? value.resultado ?? value.winner ?? value.name;
   }
 
-  const result = Number(value);
-  return Number.isFinite(result) ? result : null;
+  const s = String(value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '');
+
+  if (['player', 'jogador', 'playerwin', 'playerwins', 'playerwon', 'playerwinner', 'blue'].includes(s)) return 'Jogador';
+  if (['banker', 'banca', 'bankerwin', 'bankerwins', 'bankerwon', 'bankerwinner', 'red', 'vermelho'].includes(s)) return 'Banca';
+  if (['tie', 'draw', 'empate', 'equal', 'push', 'tied'].includes(s)) return 'Empate';
+  return null;
+}
+
+function validDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 function extractItems(body) {
@@ -141,739 +181,1257 @@ function extractItems(body) {
   if (!body || typeof body !== 'object') return [];
 
   const candidates = [
-    body.data,
-    body.results,
-    body.items,
-    body.resultados,
-    body.rounds,
-    body.events,
-    body.records,
-    body.data?.results,
-    body.data?.items,
-    body.data?.rounds,
-    body.data?.events,
-    body.data?.resultados
+    body.data, body.results, body.items, body.resultados, body.rounds, body.events,
+    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds,
+    body.data?.events, body.data?.data
   ];
-
   return candidates.find(Array.isArray) || [];
 }
 
 function normalizeRound(item) {
-  if (!item || typeof item !== 'object') return null;
+  const d = item?.data || item?.round || item || {};
+  const r = (d.result && typeof d.result === 'object')
+    ? d.result
+    : (item?.result && typeof item.result === 'object' ? item.result : {});
 
-  const source = {
-    ...(item.data && typeof item.data === 'object' ? item.data : {}),
-    ...(item.round && typeof item.round === 'object' ? item.round : {}),
-    ...item
-  };
+  const status = String(d.status ?? d.estado ?? item?.status ?? item?.estado ?? '').toLowerCase();
 
-  const id = firstDefined(
-    source.id,
-    source._id,
-    source.roundId,
-    source.round_id,
-    source.gameId,
-    source.game_id,
-    source.eventId,
-    source.event_id,
-    source.uuid
+  const inicio = validDate(
+    d.startedAt ?? d.startTime ?? d.started_at ?? d.inicio ??
+    item?.startedAt ?? item?.inicio
   );
 
-  const outcome = normalizeOutcome(firstDefined(
-    source.result,
-    source.outcome,
-    source.winner,
-    source.winningSide,
-    source.winning_side,
-    source.winnerName,
-    source.statusResult
-  ));
+  const fim = validDate(
+    d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ?? d.fim ??
+    item?.settledAt ?? item?.fim
+  );
 
-  const end = dateValue(firstDefined(
-    source.finishedAt,
-    source.finished_at,
-    source.endTime,
-    source.end_time,
-    source.endedAt,
-    source.ended_at,
-    source.createdAt,
-    source.created_at,
-    source.timestamp,
-    source.date,
-    source.time
-  ));
+  const rawOutcome =
+    r.outcome ?? r.resultado ?? r.winner ??
+    d.outcome ?? d.resultado ?? d.winner ??
+    item?.outcome ?? item?.resultado ?? item?.winner ??
+    (typeof d.result === 'string' ? d.result : null) ??
+    (typeof item?.result === 'string' ? item.result : null);
 
-  if (id === undefined || !outcome || !end) {
-    return null;
-  }
+  const resultado = normalizeOutcome(rawOutcome);
 
-  const status = String(
-    firstDefined(source.status, source.state, 'resolved')
-  ).slice(0, 50);
+  const resolvida = [
+    'resolved', 'settled', 'finished', 'complete', 'completed',
+    'resolvido', 'concluido', 'finalizado'
+  ].some(word => status.includes(word)) || Boolean(fim);
+
+  const id = String(
+    d.id ?? d.roundId ?? d.round_id ?? d.eventId ??
+    item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
+  ).trim();
+
+  if (!id || !resultado || !resolvida || !fim) return null;
+
+  const scoreJogador = Number(
+    r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ??
+    d.player_score ?? d.pontos_jogador
+  );
+
+  const scoreBanca = Number(
+    r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ??
+    d.banker_score ?? d.pontos_banca
+  );
+
+  const multiplicador = r.multiplier ?? d.multiplier ?? d.multiplicador ?? null;
 
   return {
-    id: String(id),
-    resultado: outcome,
-    estado: status,
-    inicio: dateValue(firstDefined(
-      source.startedAt,
-      source.started_at,
-      source.startTime,
-      source.start_time
-    )),
-    fim: end,
-    pontos_jogador: numeric(firstDefined(
-      source.playerScore,
-      source.player_score,
-      source.playerPoints,
-      source.player_points,
-      source.blueScore,
-      source.blue_score
-    )),
-    pontos_banca: numeric(firstDefined(
-      source.bankerScore,
-      source.banker_score,
-      source.bankerPoints,
-      source.banker_points,
-      source.redScore,
-      source.red_score
-    )),
-    multiplicador: firstDefined(
-      source.multiplier,
-      source.payoutMultiplier,
-      source.payout_multiplier
-    ) == null
-      ? null
-      : String(firstDefined(
-          source.multiplier,
-          source.payoutMultiplier,
-          source.payout_multiplier
-        )).slice(0, 40)
+    id,
+    resultado,
+    estado: 'Resolved',
+    inicio: inicio || fim,
+    fim,
+    pontos_jogador: Number.isFinite(scoreJogador) ? scoreJogador : null,
+    pontos_banca: Number.isFinite(scoreBanca) ? scoreBanca : null,
+    multiplicador: multiplicador == null ? null : String(multiplicador)
   };
+}
+
+async function telegramSend(texto) {
+  if (!BOT_TOKEN || !CHAT_ID) {
+    runtime.ultimoErroTelegram = 'BOT_TOKEN ou CHAT_ID não configurado';
+    return false;
+  }
+
+  try {
+    const payload = {
+      chat_id: CHAT_ID,
+      text: texto,
+      disable_web_page_preview: true
+    };
+    if (CONFIG.telegramParseMode) payload.parse_mode = CONFIG.telegramParseMode;
+
+    const response = await axios.post(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+      payload,
+      { timeout: 15000 }
+    );
+
+    if (response.data?.ok === true) {
+      runtime.ultimaMensagemTelegram = new Date().toISOString();
+      runtime.ultimoErroTelegram = null;
+      return true;
+    }
+
+    runtime.ultimoErroTelegram = JSON.stringify(response.data);
+    return false;
+  } catch (error) {
+    runtime.ultimoErroTelegram = error.response?.data
+      ? JSON.stringify(error.response.data)
+      : error.message;
+    log('TELEGRAM', runtime.ultimoErroTelegram);
+    return false;
+  }
 }
 
 async function ensureSchema() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bacbo_resultados (
-      id TEXT PRIMARY KEY,
-      resultado TEXT NOT NULL,
-      estado TEXT,
-      inicio TIMESTAMPTZ,
-      fim TIMESTAMPTZ NOT NULL,
-      pontos_jogador INTEGER,
-      pontos_banca INTEGER,
-      multiplicador TEXT,
-      guardado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      seq BIGSERIAL
-    )
-  `);
+  if (!pool) throw new Error('DATABASE_URL não configurada');
+  if (schemaPromise) return schemaPromise;
 
-  const columns = [
-    ['estado', 'TEXT'],
-    ['inicio', 'TIMESTAMPTZ'],
-    ['fim', 'TIMESTAMPTZ'],
-    ['pontos_jogador', 'INTEGER'],
-    ['pontos_banca', 'INTEGER'],
-    ['multiplicador', 'TEXT'],
-    ['guardado_em', 'TIMESTAMPTZ DEFAULT NOW()'],
-    ['seq', 'BIGSERIAL']
-  ];
+  schemaPromise = (async () => {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bacbo_resultados (
+        id              TEXT PRIMARY KEY,
+        resultado       TEXT NOT NULL,
+        estado          TEXT NOT NULL DEFAULT 'Resolved',
+        inicio          TIMESTAMPTZ,
+        fim             TIMESTAMPTZ,
+        pontos_jogador  INTEGER,
+        pontos_banca    INTEGER,
+        multiplicador   TEXT,
+        guardado_em     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        seq             BIGINT GENERATED ALWAYS AS IDENTITY
+      )
+    `);
 
-  for (const [name, type] of columns) {
-    await pool.query(
-      `ALTER TABLE bacbo_resultados
-       ADD COLUMN IF NOT EXISTS ${name} ${type}`
-    );
-  }
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_fim ON bacbo_resultados (fim DESC NULLS LAST)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_seq ON bacbo_resultados (seq DESC)`);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS bacbo_resultados_fim_idx
-    ON bacbo_resultados (fim DESC)
-  `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sinais (
+        id              BIGSERIAL PRIMARY KEY,
+        criado_em       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        cor             TEXT NOT NULL,
+        estado          TEXT NOT NULL DEFAULT 'PENDENTE',
+        gale            INTEGER NOT NULL DEFAULT 0,
+        resultado_id    TEXT,
+        resultado_final TEXT,
+        empates         INTEGER NOT NULL DEFAULT 0,
+        estrategia      TEXT,
+        estrategia_nome TEXT,
+        resolvido_em    TIMESTAMPTZ
+      )
+    `);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS bacbo_resultados_seq_idx
-    ON bacbo_resultados (seq DESC)
-  `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON sinais (criado_em DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_resultado_id ON sinais (resultado_id)`);
 
-  console.log('[DB] Estrutura verificada; histórico preservado.');
-}
+    // Garante no máximo 1 sinal pendente
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sinais_um_pendente
+      ON sinais ((estado))
+      WHERE estado = 'PENDENTE'
+    `);
 
-async function telegramSend(message) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    runtime.erroTelegram =
-      'Configure BOT_TOKEN e CHAT_ID nas variáveis do Render.';
-    return false;
-  }
+    log('DB', { tabelasPreparadas: true });
+  })();
 
   try {
-    const response = await axios.post(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: CHAT_ID,
-        text: message,
-        disable_web_page_preview: true
-      },
-      { timeout: 10000 }
-    );
-
-    if (!response.data?.ok) {
-      throw new Error('Telegram não confirmou a mensagem.');
-    }
-
-    runtime.ultimaMensagemTelegram = new Date().toISOString();
-    runtime.erroTelegram = null;
-    return true;
-  } catch (err) {
-    runtime.erroTelegram = safeError(err);
-    console.error('[TELEGRAM]', JSON.stringify(runtime.erroTelegram));
-    return false;
+    await schemaPromise;
+  } catch (error) {
+    schemaPromise = null;
+    throw error;
   }
 }
 
-async function fetchRounds() {
-  const started = Date.now();
+async function fetchRoundsWithRetry(maxAttempts = 3) {
+  let lastError = null;
 
-  try {
-    const response = await axios.get(API_BACBO, {
-      timeout: 20000,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'DadosAO-Monitor/2.0'
-      },
-      validateStatus: status => status >= 200 && status < 300
-    });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await axios.get(API_BACBO, {
+        timeout: 18000,
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'CapungaDadosBot/5.0'
+        }
+      });
 
-    runtime.apiHttp = response.status;
-    runtime.apiLatenciaMs = Date.now() - started;
-    runtime.erroAPI = null;
+      runtime.ultimoHTTPAPI = response.status;
+      runtime.ultimoErroAPI = null;
 
-    const body = response.data;
+      const items = extractItems(response.data);
+      const unique = new Map();
 
-    runtime.formatoResposta = Array.isArray(body)
-      ? 'array'
-      : body && typeof body === 'object'
-        ? Object.keys(body).slice(0, 25)
-        : typeof body;
-
-    const items = extractItems(body);
-    runtime.itensBrutos = items.length;
-
-    const unique = new Map();
-    let discarded = 0;
-
-    for (const item of items) {
-      const round = normalizeRound(item);
-
-      if (!round) {
-        discarded++;
-        continue;
+      for (const item of items) {
+        const round = normalizeRound(item);
+        if (round) unique.set(round.id, round);
       }
 
-      unique.set(round.id, round);
+      const rounds = [...unique.values()].sort(
+        (a, b) => new Date(a.fim) - new Date(b.fim)
+      );
+
+      runtime.itensRecebidosAPI = items.length;
+      runtime.quantidadeAPI = rounds.length;
+      runtime.ultimaHoraDaAPI = rounds.at(-1)?.fim || null;
+
+      return rounds;
+    } catch (err) {
+      lastError = err;
+      runtime.ultimoHTTPAPI = err.response?.status || null;
+      runtime.ultimoErroAPI = err.message;
+
+      if (attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, 700 * Math.pow(2, attempt - 1)));
+      }
     }
+  }
 
-    const rounds = [...unique.values()]
-      .sort((a, b) => a.fim - b.fim);
+  throw lastError || new Error('Falha na API');
+}
 
-    runtime.itensNormalizados = rounds.length;
-    runtime.itensDescartados = discarded;
+async function insertRound(round) {
+  const result = await pool.query(
+    `INSERT INTO bacbo_resultados
+       (id, resultado, estado, inicio, fim, pontos_jogador, pontos_banca, multiplicador)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (id) DO NOTHING
+     RETURNING id`,
+    [
+      round.id, round.resultado, round.estado, round.inicio, round.fim,
+      round.pontos_jogador, round.pontos_banca, round.multiplicador
+    ]
+  );
+  return result.rows.length > 0;
+}
 
-    if (items.length > 0 && rounds.length === 0) {
-      runtime.erroAPI = {
-        mensagem: 'A API devolveu dados, mas nenhum resultado foi reconhecido.'
+async function getLatestFromDB() {
+  const result = await pool.query(`
+    SELECT id, resultado, fim
+    FROM bacbo_resultados
+    ORDER BY fim DESC NULLS LAST, seq DESC
+    LIMIT 1
+  `);
+  return result.rows[0] || null;
+}
+
+async function getRecentOutcomes(limit = 40) {
+  const result = await pool.query(
+    `SELECT id, resultado, fim, pontos_jogador, pontos_banca, multiplicador
+     FROM bacbo_resultados
+     WHERE resultado IN ('Jogador', 'Banca')
+     ORDER BY fim DESC NULLS LAST, seq DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows;
+}
+
+/* ======================== ESTRATÉGIAS ======================== */
+
+function streakLen(rows) {
+  if (!rows.length) return 0;
+  const color = rows[0].resultado;
+  if (!['Jogador', 'Banca'].includes(color)) return 0;
+
+  let n = 0;
+  for (const row of rows) {
+    if (row.resultado === color) n++;
+    else break;
+  }
+  return n;
+}
+
+function stratRepeticao(rows) {
+  const n = streakLen(rows);
+  if (n < CONFIG.streakMin) return null;
+
+  return {
+    cor: rows[0].resultado,
+    estrategia: 'REPETICAO',
+    nome: `Repetição x${n}`,
+    emoji: '🔁',
+    prioridade: Math.min(90, 50 + n * 10)
+  };
+}
+
+function stratQuebra(rows) {
+  const n = streakLen(rows);
+  if (n < CONFIG.streakMin + 1) return null;
+
+  const cor = oposta(rows[0].resultado);
+  if (!cor) return null;
+
+  return {
+    cor,
+    estrategia: 'QUEBRA',
+    nome: `Quebra x${n}`,
+    emoji: '💥',
+    prioridade: Math.min(88, 55 + n * 8)
+  };
+}
+
+function stratSurf(rows) {
+  if (rows.length < 4) return null;
+
+  const a = rows[0].resultado;
+  const b = rows[1].resultado;
+
+  if (!['Jogador', 'Banca'].includes(a) || !['Jogador', 'Banca'].includes(b) || a === b) return null;
+
+  for (let i = 0; i < 4; i++) {
+    const expected = i % 2 === 0 ? a : b;
+    if (rows[i]?.resultado !== expected) return null;
+  }
+
+  return {
+    cor: b,
+    estrategia: 'SURF',
+    nome: 'Surf (alternância 4)',
+    emoji: '🌊',
+    prioridade: 78
+  };
+}
+
+function stratDoisDois(rows) {
+  if (rows.length < 4) return null;
+  const r = rows.map(x => x.resultado);
+
+  if (
+    r[0] === r[1] &&
+    r[2] === r[3] &&
+    r[0] !== r[2] &&
+    ['Jogador', 'Banca'].includes(r[0])
+  ) {
+    return {
+      cor: r[0],
+      estrategia: 'DOIS_DOIS',
+      nome: '2+2 (blocos completos)',
+      emoji: '♟️',
+      prioridade: 82
+    };
+  }
+
+  if (
+    r[0] !== r[1] &&
+    r[1] === r[2] &&
+    ['Jogador', 'Banca'].includes(r[0]) &&
+    ['Jogador', 'Banca'].includes(r[1])
+  ) {
+    return {
+      cor: r[0],
+      estrategia: 'DOIS_DOIS',
+      nome: '2+2 (possível fecho)',
+      emoji: '♟️',
+      prioridade: 75
+    };
+  }
+
+  return null;
+}
+
+function stratForca(rows) {
+  const sample = rows.slice(0, 12).filter(r => ['Jogador', 'Banca'].includes(r.resultado));
+  if (sample.length < 8) return null;
+
+  let j = 0, b = 0;
+  for (const row of sample) {
+    if (row.resultado === 'Jogador') j++;
+    else b++;
+  }
+
+  const total = j + b;
+  const pctJ = j / total;
+  const pctB = b / total;
+
+  if (pctB >= 0.65) {
+    return {
+      cor: 'Banca',
+      estrategia: 'FORCA',
+      nome: `Força da mesa Banca ${Math.round(pctB * 100)}%`,
+      emoji: '💪',
+      prioridade: 72
+    };
+  }
+
+  if (pctJ >= 0.65) {
+    return {
+      cor: 'Jogador',
+      estrategia: 'FORCA',
+      nome: `Força da mesa Jogador ${Math.round(pctJ * 100)}%`,
+      emoji: '💪',
+      prioridade: 72
+    };
+  }
+
+  return null;
+}
+
+function stratNumerica(rows) {
+  if (rows.length < 3) return null;
+
+  const last = rows[0];
+  const pj = Number(last.pontos_jogador);
+  const pb = Number(last.pontos_banca);
+
+  if (Number.isFinite(pj) && Number.isFinite(pb)) {
+    if (last.resultado === 'Jogador' && pj >= 10 && pj > pb) {
+      return {
+        cor: 'Jogador',
+        estrategia: 'NUMERICA',
+        nome: `Numérica: Jogador \( {pj}- \){pb}`,
+        emoji: '🔢',
+        prioridade: 68
       };
     }
+    if (last.resultado === 'Banca' && pb >= 10 && pb > pj) {
+      return {
+        cor: 'Banca',
+        estrategia: 'NUMERICA',
+        nome: `Numérica: Banca \( {pb}- \){pj}`,
+        emoji: '🔢',
+        prioridade: 68
+      };
+    }
+  }
 
-    return rounds;
-  } catch (err) {
-    runtime.apiLatenciaMs = Date.now() - started;
-    runtime.erroAPI = safeError(err);
+  let sameColorWithLargeDiff = true;
+  let dominantColor = null;
 
-    if (err.response) {
-      runtime.apiHttp = err.response.status;
+  for (let i = 0; i < 3; i++) {
+    const row = rows[i];
+    const a = Number(row.pontos_jogador);
+    const b = Number(row.pontos_banca);
+
+    if (
+      !Number.isFinite(a) || !Number.isFinite(b) ||
+      Math.abs(a - b) < 4 ||
+      !['Jogador', 'Banca'].includes(row.resultado)
+    ) {
+      sameColorWithLargeDiff = false;
+      break;
     }
 
-    throw err;
+    if (!dominantColor) dominantColor = row.resultado;
+    else if (row.resultado !== dominantColor) sameColorWithLargeDiff = false;
+  }
+
+  if (sameColorWithLargeDiff && dominantColor) {
+    return {
+      cor: dominantColor,
+      estrategia: 'NUMERICA',
+      nome: 'Numérica: diferença ≥4 em 3 rodadas',
+      emoji: '🔢',
+      prioridade: 70
+    };
+  }
+
+  if (rows.length >= 2) {
+    const w0 = rows[0];
+    const w1 = rows[1];
+
+    if (w0.resultado === w1.resultado && ['Jogador', 'Banca'].includes(w0.resultado)) {
+      const s0 = w0.resultado === 'Jogador' ? Number(w0.pontos_jogador) : Number(w0.pontos_banca);
+      const s1 = w1.resultado === 'Jogador' ? Number(w1.pontos_jogador) : Number(w1.pontos_banca);
+
+      if (Number.isFinite(s0) && Number.isFinite(s1) && s0 <= 5 && s1 <= 5) {
+        return {
+          cor: oposta(w0.resultado),
+          estrategia: 'NUMERICA',
+          nome: 'Numérica: duas vitórias de pontuação baixa',
+          emoji: '🔢',
+          prioridade: 65
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function detectBestEntry(rows) {
+  if (!rows || rows.length < 2) return null;
+
+  const candidates = [
+    stratRepeticao(rows),
+    stratQuebra(rows),
+    stratDoisDois(rows),
+    stratSurf(rows),
+    stratForca(rows),
+    stratNumerica(rows)
+  ].filter(Boolean);
+
+  if (!candidates.length) return null;
+
+  const order = {
+    REPETICAO: 6,
+    QUEBRA: 5,
+    DOIS_DOIS: 4,
+    SURF: 3,
+    FORCA: 2,
+    NUMERICA: 1
+  };
+
+  candidates.sort((a, b) => {
+    if (b.prioridade !== a.prioridade) return b.prioridade - a.prioridade;
+    return (order[b.estrategia] || 0) - (order[a.estrategia] || 0);
+  });
+
+  return candidates[0];
+}
+
+/* ======================== PLACAR / MENSAGENS ======================== */
+
+async function getPlacarDia() {
+  const result = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS green,
+      COUNT(*) FILTER (WHERE estado = 'G1')::int AS g1,
+      COUNT(*) FILTER (WHERE estado = 'G2')::int AS g2,
+      COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss,
+      COALESCE(SUM(empates), 0)::int AS empates,
+      COUNT(*) FILTER (WHERE estado = 'PENDENTE')::int AS pendentes,
+      COUNT(*) FILTER (WHERE estado = 'CANCELADO')::int AS cancelados
+    FROM sinais
+    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+                     AT TIME ZONE 'Africa/Luanda'
+  `);
+
+  const s = result.rows[0] || {};
+  const green = Number(s.green || 0);
+  const g1 = Number(s.g1 || 0);
+  const g2 = Number(s.g2 || 0);
+  const loss = Number(s.loss || 0);
+  const wins = green + g1 + g2;
+  const closed = wins + loss;
+  const percent = closed > 0 ? Number(((wins / closed) * 100).toFixed(1)) : 0;
+
+  const recent = await pool.query(`
+    SELECT estado FROM sinais
+    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+                     AT TIME ZONE 'Africa/Luanda'
+      AND estado IN ('GREEN', 'G1', 'G2', 'LOSS')
+    ORDER BY criado_em DESC, id DESC
+    LIMIT 50
+  `);
+
+  let greensSeguidos = 0;
+  for (const row of recent.rows) {
+    if (['GREEN', 'G1', 'G2'].includes(row.estado)) greensSeguidos++;
+    else break;
+  }
+
+  return {
+    totalSinais: closed + Number(s.pendentes || 0) + Number(s.cancelados || 0),
+    green, g1, g2,
+    empates: Number(s.empates || 0),
+    loss,
+    pendentes: Number(s.pendentes || 0),
+    cancelados: Number(s.cancelados || 0),
+    finalizados: closed,
+    acertos: wins,
+    percent,
+    greensSeguidos
+  };
+}
+
+function formatPlacar(p) {
+  return [
+    '',
+    '┏━━━━━━━━━━━━━━━━━━━━┓',
+    '📊 PLACAR DO DIA',
+    '┗━━━━━━━━━━━━━━━━━━━━┛',
+    `🎯 Sinais registados: ${p.totalSinais}`,
+    `✅ Green directo: ${p.green}`,
+    `⚡ Green G1: ${p.g1}`,
+    `🔥 Green G2: ${p.g2}`,
+    `🟡 Empates protegidos: ${p.empates}`,
+    `❌ Reds: ${p.loss}`,
+    `⏳ Pendentes: ${p.pendentes}`,
+    `📈 Taxa de acerto: ${p.percent}%`,
+    `🏁 Greens seguidos: ${p.greensSeguidos}`,
+    '━━━━━━━━━━━━━━━━━━━━'
+  ].join('\n');
+}
+
+async function getPendingSignal() {
+  const result = await pool.query(`
+    SELECT * FROM sinais
+    WHERE estado = 'PENDENTE'
+    ORDER BY criado_em ASC, id ASC
+    LIMIT 1
+  `);
+  return result.rows[0] || null;
+}
+
+async function expirePendingSignal(signal) {
+  if (!signal) return false;
+
+  const age = Date.now() - new Date(signal.criado_em).getTime();
+  if (age < CONFIG.sinalExpiraMin * 60000) return false;
+
+  await pool.query(
+    `UPDATE sinais
+     SET estado = 'CANCELADO', resolvido_em = NOW()
+     WHERE id = $1 AND estado = 'PENDENTE'`,
+    [signal.id]
+  );
+
+  await telegramSend([
+    '⏰ SINAL CANCELADO POR EXPIRAÇÃO',
+    `🆔 Sinal #${signal.id}`,
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n'));
+
+  log('SINAL EXPIRADO', { id: signal.id });
+  return true;
+}
+
+function msgNovoSinal(entry, signalId) {
+  return [
+    '╔════════════════════╗',
+    '🎲 CAPUNGA DADOS · BAC BO',
+    '╚════════════════════╝',
+    '🚨 NOVO SINAL REGISTADO',
+    '━━━━━━━━━━━━━━━━━━━━',
+    `🆔 Sinal #${signalId}`,
+    `🎯 Entrada: ${corDisplay(entry.cor)}`,
+    `${entry.emoji} Estratégia: ${entry.nome}`,
+    `🛡️ Proteção: ${CONFIG.empateProtegido ? 'Empate protegido' : 'Sem proteção de empate'}`,
+    `🔁 Gales máximos: ${CONFIG.maxGale}`,
+    `🕒 Hora Angola: ${horaAngola()}`,
+    '━━━━━━━━━━━━━━━━━━━━',
+    '⚠️ Padrões históricos não garantem o próximo resultado.'
+  ].join('\n');
+}
+
+function msgResultadoGreen(signal, state) {
+  const title = state === 'GREEN'
+    ? '✅ GREEN DIRECTO'
+    : state === 'G1' ? '⚡ GREEN NO GALE 1' : '🔥 GREEN NO GALE 2';
+
+  return [
+    '╔════════════════════╗',
+    '📋 RESULTADO DO SINAL',
+    '╚════════════════════╝',
+    title,
+    `🆔 Sinal #${signal.id}`,
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `🧠 Estratégia: ${signal.estrategia_nome || signal.estrategia || 'N/D'}`,
+    `🐓 Gales usados: ${Number(signal.gale || 0)}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgResultadoLoss(signal) {
+  return [
+    '╔════════════════════╗',
+    '📋 RESULTADO DO SINAL',
+    '╚════════════════════╝',
+    '❌ RED FINAL',
+    `🆔 Sinal #${signal.id}`,
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `🧠 Estratégia: ${signal.estrategia_nome || signal.estrategia || 'N/D'}`,
+    `🐓 Gales usados: \( {Number(signal.gale || 0)}/ \){CONFIG.maxGale}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgGale(signal, nextGale) {
+  return [
+    '╔════════════════════╗',
+    `🐓 GALE ${nextGale}`,
+    '╚════════════════════╝',
+    `🆔 Sinal #${signal.id}`,
+    `🎯 Manter entrada: ${corDisplay(signal.cor)}`,
+    `🧠 Estratégia: ${signal.estrategia_nome || signal.estrategia || 'N/D'}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+function msgEmpate(signal) {
+  return [
+    '╔════════════════════╗',
+    '🟡 EMPATE PROTEGIDO',
+    '━━━━━━━━━━━━━━━━━━━━',
+    `🆔 Sinal #${signal.id} continua pendente`,
+    `🎯 Entrada: ${corDisplay(signal.cor)}`,
+    `🟡 Empates registados: ${Number(signal.empates || 0) + 1}`,
+    `🕒 ${horaAngola()}`
+  ].join('\n');
+}
+
+async function maybeCreateSignal(round) {
+  if (!CONFIG.sinaisAtivos) {
+    runtime.motivoSemSinal = 'sinais_desativados';
+    return;
+  }
+
+  if (!['Jogador', 'Banca'].includes(round.resultado)) {
+    runtime.motivoSemSinal = 'resultado_empate';
+    return;
+  }
+
+  const pending = await getPendingSignal();
+  if (pending && !(await expirePendingSignal(pending))) {
+    runtime.motivoSemSinal = `sinal_pendente_#${pending.id}`;
+    return;
+  }
+
+  const lastResult = await pool.query(`
+    SELECT criado_em FROM sinais
+    WHERE estado <> 'CANCELADO'
+    ORDER BY criado_em DESC, id DESC
+    LIMIT 1
+  `);
+
+  const last = lastResult.rows[0];
+  if (
+    last?.criado_em &&
+    Date.now() - new Date(last.criado_em).getTime() < CONFIG.intervaloMinimoMs
+  ) {
+    runtime.motivoSemSinal = 'intervalo_minimo';
+    return;
+  }
+
+  const rows = await getRecentOutcomes(30);
+  const entry = detectBestEntry(rows);
+
+  if (!entry) {
+    const recent = rows.slice(0, 6).map(r => r.resultado[0]).join('');
+    runtime.motivoSemSinal = `sem_setup[${recent}]`;
+    return;
+  }
+
+  // Não criar mais de um sinal baseado na mesma rodada
+  const used = await pool.query(
+    `SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1`,
+    [round.id]
+  );
+  if (used.rows.length) {
+    runtime.motivoSemSinal = 'rodada_ja_usada';
+    return;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO sinais
+       (cor, estado, gale, resultado_id, empates, estrategia, estrategia_nome)
+     VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4)
+     RETURNING *`,
+    [entry.cor, round.id, entry.estrategia, entry.nome]
+  );
+
+  const signal = inserted.rows[0];
+
+  runtime.ultimoSinal = {
+    id: signal.id,
+    cor: signal.cor,
+    estado: signal.estado,
+    criado_em: signal.criado_em,
+    estrategia: signal.estrategia,
+    estrategia_nome: signal.estrategia_nome
+  };
+  runtime.ultimaEstrategia = entry;
+  runtime.motivoSemSinal = null;
+
+  const sent = await telegramSend(msgNovoSinal(entry, signal.id));
+  if (!sent) log('AVISO', { sinalCriado: signal.id, telegramEnviado: false });
+
+  log('SINAL CRIADO', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia });
+}
+
+async function resolvePending(round) {
+  const signal = await getPendingSignal();
+  if (!signal) return;
+  if (String(signal.resultado_id) === String(round.id)) return;
+  if (await expirePendingSignal(signal)) return;
+
+  if (round.resultado === 'Empate') {
+    if (!CONFIG.empateProtegido) return;
+
+    const updated = await pool.query(
+      `UPDATE sinais
+       SET empates = COALESCE(empates, 0) + 1
+       WHERE id = $1 AND estado = 'PENDENTE'
+       RETURNING *`,
+      [signal.id]
+    );
+
+    if (updated.rows[0]) await telegramSend(msgEmpate(updated.rows[0]));
+    return;
+  }
+
+  if (round.resultado === signal.cor) {
+    const galeNum = Number(signal.gale || 0);
+    const state = galeNum === 0 ? 'GREEN' : galeNum === 1 ? 'G1' : 'G2';
+
+    const updated = await pool.query(
+      `UPDATE sinais
+       SET estado = $1, resultado_final = $2, resolvido_em = NOW()
+       WHERE id = $3 AND estado = 'PENDENTE'
+       RETURNING *`,
+      [state, round.resultado, signal.id]
+    );
+
+    if (updated.rows[0]) {
+      const placar = await getPlacarDia();
+      await telegramSend(msgResultadoGreen(updated.rows[0], state) + formatPlacar(placar));
+      log('SINAL RESOLVIDO', { id: signal.id, estado: state });
+    }
+    return;
+  }
+
+  const nextGale = Number(signal.gale || 0) + 1;
+
+  if (nextGale <= CONFIG.maxGale) {
+    const updated = await pool.query(
+      `UPDATE sinais SET gale = $1
+       WHERE id = $2 AND estado = 'PENDENTE'
+       RETURNING *`,
+      [nextGale, signal.id]
+    );
+
+    if (updated.rows[0]) {
+      await telegramSend(msgGale(updated.rows[0], nextGale));
+      log('GALE', { id: signal.id, gale: nextGale });
+    }
+    return;
+  }
+
+  const updated = await pool.query(
+    `UPDATE sinais
+     SET estado = 'LOSS', resultado_final = $1, resolvido_em = NOW()
+     WHERE id = $2 AND estado = 'PENDENTE'
+     RETURNING *`,
+    [round.resultado, signal.id]
+  );
+
+  if (updated.rows[0]) {
+    const placar = await getPlacarDia();
+    await telegramSend(msgResultadoLoss(updated.rows[0]) + formatPlacar(placar));
+    log('SINAL RED', { id: signal.id });
   }
 }
 
-async function saveRound(round) {
-  const inserted = await pool.query(`
-    INSERT INTO bacbo_resultados (
-      id, resultado, estado, inicio, fim,
-      pontos_jogador, pontos_banca, multiplicador, guardado_em
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-    ON CONFLICT (id) DO NOTHING
-    RETURNING id
-  `, [
-    round.id,
-    round.resultado,
-    round.estado,
-    round.inicio,
-    round.fim,
-    round.pontos_jogador,
-    round.pontos_banca,
-    round.multiplicador
-  ]);
-
-  if (inserted.rowCount > 0) {
-    return 'novo';
-  }
-
-  const updated = await pool.query(`
-    UPDATE bacbo_resultados SET
-      resultado=$2,
-      estado=$3,
-      inicio=$4,
-      fim=$5,
-      pontos_jogador=$6,
-      pontos_banca=$7,
-      multiplicador=$8
-    WHERE id=$1 AND (
-      resultado IS DISTINCT FROM $2 OR
-      estado IS DISTINCT FROM $3 OR
-      inicio IS DISTINCT FROM $4 OR
-      fim IS DISTINCT FROM $5 OR
-      pontos_jogador IS DISTINCT FROM $6 OR
-      pontos_banca IS DISTINCT FROM $7 OR
-      multiplicador IS DISTINCT FROM $8
-    )
-    RETURNING id
-  `, [
-    round.id,
-    round.resultado,
-    round.estado,
-    round.inicio,
-    round.fim,
-    round.pontos_jogador,
-    round.pontos_banca,
-    round.multiplicador
-  ]);
-
-  return updated.rowCount > 0 ? 'atualizado' : 'inalterado';
-}
-
+/**
+ * Fluxo principal de sincronização
+ */
 async function syncOnce() {
-  if (runtime.sincronizacaoEmCurso || stopping) {
-    return { ignorado: true };
+  if (!pool) throw new Error('DATABASE_URL não configurada');
+  if (runtime.sincronizacaoEmCurso || shuttingDown) {
+    return { sucesso: false, ignorada: true };
   }
 
   runtime.sincronizacaoEmCurso = true;
   const started = Date.now();
 
-  let novos = 0;
-  let atualizados = 0;
-  let inalterados = 0;
-
   try {
-    const rounds = await fetchRounds();
+    await ensureSchema();
 
-    for (const round of rounds) {
-      const result = await saveRound(round);
+    const countBefore = await pool.query(`SELECT COUNT(*)::int AS total FROM bacbo_resultados`);
+    const hadHistory = Number(countBefore.rows[0].total) > 0;
 
-      if (result === 'novo') {
-        novos++;
-        runtime.ultimoResultadoNovoEm = new Date().toISOString();
-        runtime.ultimoId = round.id;
+    const rounds = await fetchRoundsWithRetry();
 
-        if (TELEGRAM_NOTIFY_NEW_RESULT) {
-          await telegramSend(
-            'Dados AO — novo resultado registado\n' +
-            `Resultado: ${round.resultado}\n` +
-            `Hora: ${round.fim.toISOString()}\n` +
-            'Mensagem informativa; não é recomendação de aposta.'
-          );
-        }
-      } else if (result === 'atualizado') {
-        atualizados++;
+    // Detecção de gap
+    if (runtime.ultimaSincronizacao && rounds.length > 0) {
+      const oldestInBatch = new Date(rounds[0].fim).getTime();
+      const lastSync = new Date(runtime.ultimaSincronizacao).getTime();
+      const gapMs = oldestInBatch - lastSync;
+      if (gapMs > 3 * 60 * 1000) {
+        runtime.gapDetectado = { gapMs, oldestInBatch: rounds[0].fim };
+        await alertIndependent(`Possível perda de rodadas (gap \~${Math.round(gapMs / 1000)}s)`);
       } else {
-        inalterados++;
+        runtime.gapDetectado = null;
       }
     }
 
-    runtime.ultimaSincronizacao = new Date().toISOString();
-    runtime.ultimaSincronizacaoBemSucedida =
-      runtime.ultimaSincronizacao;
+    let inserted = 0;
+    let duplicates = 0;
+    let evaluated = 0;
+    let lastNew = null;
 
-    runtime.novos = novos;
-    runtime.atualizados = atualizados;
-    runtime.inalterados = inalterados;
-    runtime.ciclosSemNovos = novos
-      ? 0
-      : runtime.ciclosSemNovos + 1;
+    for (const round of rounds) {
+      const saved = await insertRound(round);
 
-    runtime.erroDB = null;
-    runtime.falhasConsecutivas = 0;
+      if (!saved) {
+        duplicates++;
+        continue;
+      }
 
-    if (novos || atualizados) {
-      console.log('[SYNC]', JSON.stringify({
-        sucesso: true,
-        recebidos: runtime.itensBrutos,
-        normalizados: rounds.length,
-        novos,
-        atualizados,
-        inalterados
-      }));
+      inserted++;
+      lastNew = round;
+
+      // Só avalia sinais depois da base histórica existir
+      if (hadHistory) {
+        await resolvePending(round);
+        await maybeCreateSignal(round);
+        evaluated++;
+      }
     }
 
-    return {
-      sucesso: true,
-      recebidos: runtime.itensBrutos,
-      normalizados: rounds.length,
-      novos,
-      atualizados,
-      inalterados
+    if (!hadHistory && inserted > 0) {
+      log('BASE HISTÓRICA CRIADA', {
+        importados: inserted,
+        sinaisAntigosPublicados: false
+      });
+      runtime.motivoSemSinal = 'a_inicializar_base_historica';
+    } else if (inserted === 0) {
+      runtime.ciclosSemNovos += 1;
+      const pending = await getPendingSignal();
+      if (pending) await expirePendingSignal(pending);
+      if (!runtime.motivoSemSinal) runtime.motivoSemSinal = 'a_aguardar_nova_rodada_da_api';
+    } else {
+      runtime.ciclosSemNovos = 0;
+    }
+
+    const latest = await getLatestFromDB();
+
+    runtime.ultimaRodadaDB = latest?.fim || null;
+    runtime.ultimoIdDB = latest?.id || null;
+    runtime.sincronizacaoInicialConcluida = true;
+    runtime.ultimaSincronizacao = new Date().toISOString();
+    runtime.duplicadosUltimoCiclo = duplicates;
+    runtime.novosUltimoCiclo = inserted;
+    runtime.erroSincronizacao = null;
+    runtime.errosConsecutivos = 0;
+    runtime.ultimaDuracaoSyncMs = Date.now() - started;
+
+    if (lastNew) {
+      runtime.ultimaRodadaNova = new Date().toISOString();
+      runtime.ultimoIdNovo = lastNew.id;
+    }
+
+    const summary = {
+      recebidos: rounds.length,
+      novosGuardados: inserted,
+      duplicados,
+      sinaisAvaliados: evaluated,
+      motivoSemSinal: runtime.motivoSemSinal,
+      ultimaEstrategia: runtime.ultimaEstrategia?.estrategia || null,
+      ciclosSemNovos: runtime.ciclosSemNovos,
+      duracaoMs: runtime.ultimaDuracaoSyncMs,
+      horaAngola: horaAngola()
     };
-  } catch (err) {
-    runtime.falhasConsecutivas++;
-    runtime.erroDB = safeError(err);
 
-    console.error('[SYNC]', JSON.stringify({
-      erro: safeError(err),
-      falhasConsecutivas: runtime.falhasConsecutivas
-    }));
+    if (inserted > 0 || runtime.ciclosSemNovos % 10 === 0) {
+      log('SINCRONIZACAO', summary);
+    }
 
-    return { sucesso: false, erro: safeError(err) };
+    return { sucesso: true, ...summary };
+  } catch (error) {
+    runtime.erroSincronizacao = error.message || String(error);
+    runtime.ultimaDuracaoSyncMs = Date.now() - started;
+    runtime.errosConsecutivos++;
+
+    log('ERRO SINCRONIZACAO', runtime.erroSincronizacao);
+
+    if (runtime.errosConsecutivos >= 3) {
+      await alertIndependent(`3+ erros consecutivos: ${runtime.erroSincronizacao}`);
+    }
+
+    return { sucesso: false, erro: runtime.erroSincronizacao };
   } finally {
-    runtime.duracaoMs = Date.now() - started;
     runtime.sincronizacaoEmCurso = false;
   }
 }
 
+/* ======================== ROTAS ======================== */
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: 'ADMIN_TOKEN não configurado.'
-    });
+    return res.status(503).json({ sucesso: false, erro: 'ADMIN_TOKEN não configurado' });
   }
-
-  const supplied = req.get('x-admin-token') || '';
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(ADMIN_TOKEN);
-
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({
-      sucesso: false,
-      erro: 'Não autorizado.'
-    });
+  if (req.get('x-admin-token') !== ADMIN_TOKEN) {
+    return res.status(401).json({ sucesso: false, erro: 'Token inválido' });
   }
-
   next();
 }
 
-function diagnostics() {
-  return {
+app.get('/', (_req, res) => {
+  res.json({
+    nome: 'Capunga Dados — BAC BO Telegram',
+    estado: 'online',
+    horaAngola: horaAngola(),
+    estrategia: ['REPETICAO', 'QUEBRA', 'SURF', 'DOIS_DOIS', 'FORCA', 'NUMERICA'],
+    modo: 'sinais apenas quando existe configuração elegível',
+    rotas: ['/health', '/diagnostico', '/resultados', '/sinais', '/estatisticas']
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.json({
+    sucesso: true,
+    estado: 'online',
+    horaAngola: horaAngola(),
     iniciadoEm: runtime.iniciadoEm,
     ultimaSincronizacao: runtime.ultimaSincronizacao,
-    ultimaSincronizacaoBemSucedida:
-      runtime.ultimaSincronizacaoBemSucedida,
-    ultimoResultadoNovoEm: runtime.ultimoResultadoNovoEm,
-    api: {
-      http: runtime.apiHttp,
-      latenciaMs: runtime.apiLatenciaMs,
-      erro: runtime.erroAPI,
-      formatoResposta: runtime.formatoResposta
-    },
-    recolha: {
-      itensBrutos: runtime.itensBrutos,
-      itensNormalizados: runtime.itensNormalizados,
-      itensDescartados: runtime.itensDescartados,
-      novos: runtime.novos,
-      atualizados: runtime.atualizados,
-      inalterados: runtime.inalterados,
-      ciclosSemNovos: runtime.ciclosSemNovos,
-      duracaoMs: runtime.duracaoMs
-    },
-    baseDados: { erro: runtime.erroDB },
-    telegram: {
-      configurado: Boolean(BOT_TOKEN && CHAT_ID),
-      ultimaMensagem: runtime.ultimaMensagemTelegram,
-      erro: runtime.erroTelegram
-    },
-    falhasConsecutivas: runtime.falhasConsecutivas,
-    sincronizacaoEmCurso: runtime.sincronizacaoEmCurso
-  };
-}
-
-app.use(cors({
-  origin: process.env.CORS_ORIGIN
-    ? process.env.CORS_ORIGIN.split(',').map(v => v.trim())
-    : false
-}));
-
-app.get('/', (req, res) => {
-  res.json({
-    nome: 'Capunga Dados — BAC BO Monitor',
-    estado: 'online',
-    horaAngola: nowAngola(),
-    rotas: [
-      '/health',
-      '/diagnostico',
-      '/resultados',
-      '/estatisticas'
-    ]
+    ultimaRodadaNova: runtime.ultimaRodadaNova,
+    ultimoIdNovo: runtime.ultimoIdNovo,
+    novosUltimoCiclo: runtime.novosUltimoCiclo,
+    ciclosSemNovos: runtime.ciclosSemNovos,
+    motivoSemSinal: runtime.motivoSemSinal,
+    erroSincronizacao: runtime.erroSincronizacao,
+    ultimoErroAPI: runtime.ultimoErroAPI,
+    ultimoErroTelegram: runtime.ultimoErroTelegram,
+    ultimaDuracaoSyncMs: runtime.ultimaDuracaoSyncMs,
+    ultimaEstrategia: runtime.ultimaEstrategia,
+    gapDetectado: runtime.gapDetectado
   });
 });
 
-app.get('/health', async (req, res) => {
-  let dbOk = false;
+app.get('/diagnostico', async (_req, res) => {
+  let ultimoResultadoDB = null;
+  let totalResultados = 0;
+  let totalSinais = 0;
+  let pendentes = 0;
+  let recentes = [];
 
   try {
-    await pool.query('SELECT 1');
-    dbOk = true;
-  } catch (_) {}
+    if (pool) {
+      await ensureSchema();
 
-  const last = runtime.ultimaSincronizacaoBemSucedida
-    ? Date.now() -
-      new Date(runtime.ultimaSincronizacaoBemSucedida).getTime()
-    : null;
+      const r1 = await pool.query(`
+        SELECT id, resultado, fim, pontos_jogador, pontos_banca
+        FROM bacbo_resultados
+        ORDER BY fim DESC NULLS LAST, seq DESC LIMIT 1
+      `);
+      ultimoResultadoDB = r1.rows[0] || null;
 
-  const stale = last === null ||
-    last > Math.max(120000, INTERVALO_SYNC_MS * 5);
+      totalResultados = Number((await pool.query('SELECT COUNT(*)::int AS total FROM bacbo_resultados')).rows[0].total);
+      totalSinais = Number((await pool.query('SELECT COUNT(*)::int AS total FROM sinais')).rows[0].total);
+      pendentes = Number((await pool.query(`SELECT COUNT(*)::int AS total FROM sinais WHERE estado = 'PENDENTE'`)).rows[0].total);
 
-  const healthy = dbOk && !stale;
-
-  res.status(healthy ? 200 : 503).json({
-    estado: healthy ? 'saudavel' : 'degradado',
-    servidor: 'online',
-    baseDados: dbOk ? 'online' : 'indisponivel',
-    sincronizacaoDesatualizada: stale,
-    idadeUltimaSincronizacaoMs: last,
-    horaAngola: nowAngola()
-  });
-});
-
-app.get('/diagnostico', async (req, res) => {
-  try {
-    const total = await pool.query(`
-      SELECT COUNT(*)::bigint AS total
-      FROM bacbo_resultados
-    `);
-
-    const latest = await pool.query(`
-      SELECT id, resultado, estado, inicio, fim,
-        pontos_jogador, pontos_banca, multiplicador, guardado_em
-      FROM bacbo_resultados
-      ORDER BY fim DESC NULLS LAST, seq DESC
-      LIMIT 1
-    `);
-
-    const recent = await pool.query(`
-      SELECT id, resultado, estado, fim,
-        pontos_jogador, pontos_banca, multiplicador
-      FROM bacbo_resultados
-      ORDER BY fim DESC NULLS LAST, seq DESC
-      LIMIT 10
-    `);
-
-    res.json({
-      sucesso: !runtime.erroDB,
-      nome: 'Capunga Dados — BAC BO Monitor',
-      horaAngola: nowAngola(),
-      totalResultados: Number(total.rows[0].total),
-      ultimoResultado: latest.rows[0] || null,
-      recentes: recent.rows,
-      sincronizacao: diagnostics()
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err),
-      sincronizacao: diagnostics()
-    });
+      recentes = (await pool.query(`
+        SELECT resultado, pontos_jogador, pontos_banca, fim
+        FROM bacbo_resultados
+        WHERE resultado IN ('Jogador','Banca','Empate')
+        ORDER BY fim DESC NULLS LAST, seq DESC LIMIT 12
+      `)).rows;
+    }
+  } catch (error) {
+    runtime.erroSincronizacao = runtime.erroSincronizacao || error.message;
   }
+
+  res.json({
+    sucesso: true,
+    nome: 'Capunga Dados — BAC BO Telegram',
+    iniciadoEm: runtime.iniciadoEm,
+    horaAngola: horaAngola(),
+    telegramConfigurado: Boolean(BOT_TOKEN && CHAT_ID),
+    databaseConfigurada: Boolean(DATABASE_URL),
+    httpAPI: runtime.ultimoHTTPAPI,
+    erroAPI: runtime.ultimoErroAPI,
+    ultimaSincronizacao: runtime.ultimaSincronizacao,
+    ultimaRodadaNova: runtime.ultimaRodadaNova,
+    novosUltimoCiclo: runtime.novosUltimoCiclo,
+    ciclosSemNovos: runtime.ciclosSemNovos,
+    motivoSemSinal: runtime.motivoSemSinal,
+    ultimoSinal: runtime.ultimoSinal,
+    ultimaEstrategia: runtime.ultimaEstrategia,
+    ultimosResultados: recentes,
+    baseDados: { totalResultados, totalSinais, pendentes, ultimoResultadoDB },
+    configuracao: CONFIG
+  });
 });
 
 app.get('/resultados', async (req, res) => {
-  const parsed = Number.parseInt(req.query.limit || '50', 10);
-  const limit = Math.min(500, Math.max(1, parsed || 50));
-  const before = req.query.before
-    ? dateValue(req.query.before)
-    : null;
-
-  if (req.query.before && !before) {
-    return res.status(400).json({
-      sucesso: false,
-      erro: 'O parâmetro before deve ser uma data válida.'
-    });
-  }
-
-  try {
-    const result = before
-      ? await pool.query(`
-          SELECT id, resultado, estado, inicio, fim,
-            pontos_jogador, pontos_banca, multiplicador, guardado_em
-          FROM bacbo_resultados
-          WHERE fim < $1
-          ORDER BY fim DESC NULLS LAST, seq DESC
-          LIMIT $2
-        `, [before, limit])
-      : await pool.query(`
-          SELECT id, resultado, estado, inicio, fim,
-            pontos_jogador, pontos_banca, multiplicador, guardado_em
-          FROM bacbo_resultados
-          ORDER BY fim DESC NULLS LAST, seq DESC
-          LIMIT $1
-        `, [limit]);
-
-    res.json({
-      sucesso: true,
-      quantidade: result.rowCount,
-      limite: limit,
-      proximaPaginaAntesDe: result.rows.length
-        ? result.rows[result.rows.length - 1].fim
-        : null,
-      resultados: result.rows
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err)
-    });
-  }
-});
-
-app.get('/estatisticas', async (req, res) => {
-  try {
-    const counts = await pool.query(`
-      SELECT resultado, COUNT(*)::bigint AS quantidade
-      FROM bacbo_resultados
-      GROUP BY resultado
-      ORDER BY resultado
-    `);
-
-    const quality = await pool.query(`
-      SELECT
-        COUNT(*)::bigint AS total,
-        COUNT(*) FILTER (
-          WHERE pontos_jogador IS NULL OR pontos_banca IS NULL
-        )::bigint AS sem_pontuacao,
-        MIN(fim) AS primeiro_resultado,
-        MAX(fim) AS ultimo_resultado
-      FROM bacbo_resultados
-    `);
-
-    res.json({
-      sucesso: true,
-      distribuicaoHistorica: counts.rows.map(row => ({
-        resultado: row.resultado,
-        quantidade: Number(row.quantidade)
-      })),
-      qualidadeHistorico: {
-        total: Number(quality.rows[0].total),
-        semPontuacao: Number(quality.rows[0].sem_pontuacao),
-        primeiroResultado: quality.rows[0].primeiro_resultado,
-        ultimoResultado: quality.rows[0].ultimo_resultado
-      },
-      nota: 'Estatísticas descritivas do histórico; não preveem resultados futuros.'
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err)
-    });
-  }
-});
-
-app.post('/db/preparar', requireAdmin, async (req, res) => {
   try {
     await ensureSchema();
-    res.json({
-      sucesso: true,
-      mensagem: 'Estrutura verificada; histórico preservado.'
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err)
-    });
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), 500);
+
+    const result = await pool.query(`
+      SELECT id, resultado, estado, inicio, fim, pontos_jogador, pontos_banca, multiplicador, guardado_em
+      FROM bacbo_resultados
+      ORDER BY fim DESC NULLS LAST, seq DESC
+      LIMIT $1
+    `, [limit]);
+
+    res.json({ sucesso: true, total: result.rows.length, resultados: result.rows });
+  } catch (error) {
+    res.status(500).json({ sucesso: false, erro: error.message });
   }
 });
 
-app.post('/db/sincronizar', requireAdmin, async (req, res) => {
-  const result = await syncOnce();
-  res.status(result.sucesso === false ? 502 : 200).json(result);
+app.get('/sinais', async (req, res) => {
+  try {
+    await ensureSchema();
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), 500);
+
+    const result = await pool.query(`
+      SELECT * FROM sinais
+      ORDER BY criado_em DESC, id DESC
+      LIMIT $1
+    `, [limit]);
+
+    res.json({ sucesso: true, total: result.rows.length, sinais: result.rows });
+  } catch (error) {
+    res.status(500).json({ sucesso: false, erro: error.message });
+  }
 });
 
-app.post('/telegram/teste', requireAdmin, async (req, res) => {
-  const ok = await telegramSend(
-    'Dados AO — teste de comunicação do monitor. Mensagem informativa.'
-  );
+app.get('/estatisticas', async (_req, res) => {
+  try {
+    await ensureSchema();
 
-  res.status(ok ? 200 : 502).json({ sucesso: ok });
+    const result = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS green,
+        COUNT(*) FILTER (WHERE estado = 'G1')::int AS g1,
+        COUNT(*) FILTER (WHERE estado = 'G2')::int AS g2,
+        COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss,
+        COUNT(*) FILTER (WHERE estado = 'PENDENTE')::int AS pendentes,
+        COUNT(*) FILTER (WHERE estado = 'CANCELADO')::int AS cancelados,
+        COALESCE(SUM(empates), 0)::int AS empates
+      FROM sinais
+    `);
+
+    const stats = result.rows[0];
+    const wins = Number(stats.green || 0) + Number(stats.g1 || 0) + Number(stats.g2 || 0);
+    const finalized = wins + Number(stats.loss || 0);
+    const rate = finalized > 0 ? Number(((wins / finalized) * 100).toFixed(1)) : null;
+
+    const byStrategy = (await pool.query(`
+      SELECT
+        COALESCE(estrategia, 'DESCONHECIDA') AS estrategia,
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS green,
+        COUNT(*) FILTER (WHERE estado = 'G1')::int AS g1,
+        COUNT(*) FILTER (WHERE estado = 'G2')::int AS g2,
+        COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS reds,
+        COUNT(*) FILTER (WHERE estado IN ('GREEN','G1','G2'))::int AS acertos
+      FROM sinais
+      GROUP BY 1
+      ORDER BY total DESC
+    `)).rows;
+
+    const placarDia = await getPlacarDia();
+
+    res.json({
+      sucesso: true,
+      estatisticas: {
+        ...stats,
+        greens: wins,
+        finalizados: finalized,
+        taxaAcertoPercent: rate
+      },
+      porEstrategia: byStrategy,
+      placarDia,
+      horaAngola: horaAngola()
+    });
+  } catch (error) {
+    res.status(500).json({ sucesso: false, erro: error.message });
+  }
+});
+
+app.post('/db/preparar', requireAdmin, async (_req, res) => {
+  try {
+    await ensureSchema();
+    res.json({ sucesso: true, mensagem: 'Tabelas preparadas' });
+  } catch (error) {
+    res.status(500).json({ sucesso: false, erro: error.message });
+  }
+});
+
+app.post('/db/sincronizar', requireAdmin, async (_req, res) => {
+  try {
+    const result = await syncOnce();
+    res.status(result.sucesso ? 200 : 500).json(result);
+  } catch (error) {
+    res.status(500).json({ sucesso: false, erro: error.message || String(error) });
+  }
+});
+
+app.post('/telegram/teste', requireAdmin, async (_req, res) => {
+  const sent = await telegramSend([
+    '╔════════════════════╗',
+    '🎲 CAPUNGA DADOS · BAC BO',
+    '╚════════════════════╝',
+    '✅ Teste de ligação Telegram concluído.',
+    `🕒 ${horaAngola()}`
+  ].join('\n'));
+
+  res.status(sent ? 200 : 502).json({
+    sucesso: sent,
+    erro: runtime.ultimoErroTelegram
+  });
 });
 
 app.use((req, res) => {
   res.status(404).json({
     sucesso: false,
-    erro: 'Rota não encontrada.'
+    erro: 'Rota não encontrada',
+    caminho: req.path
   });
 });
 
-app.use((err, req, res, next) => {
-  console.error('[HTTP]', safeError(err));
-
-  if (res.headersSent) return next(err);
-
-  res.status(500).json({
-    sucesso: false,
-    erro: 'Erro interno do servidor.'
-  });
-});
+/* ======================== LIFECYCLE ======================== */
 
 async function start() {
+  if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada no Render');
+
   await ensureSchema();
 
   server = app.listen(PORT, '0.0.0.0', () => {
-    console.log('[START]', JSON.stringify({
-      nome: 'CAPUNGA DADOS — BAC BO MONITOR',
+    log('START', {
+      nome: 'CAPUNGA DADOS — BAC BO TELEGRAM v5',
       porta: PORT,
-      intervaloSyncMs: INTERVALO_SYNC_MS,
-      horaAngola: nowAngola()
-    }));
+      horaAngola: horaAngola(),
+      sinaisAtivos: CONFIG.sinaisAtivos,
+      streakMin: CONFIG.streakMin,
+      maxGale: CONFIG.maxGale,
+      intervaloSyncMs: CONFIG.intervaloSyncMs,
+      intervaloMinimoMs: CONFIG.intervaloMinimoMs
+    });
   });
 
-  await syncOnce();
+  const initial = await syncOnce();
+  if (!initial.sucesso) log('PRIMEIRA SYNC COM ERRO', initial.erro || initial);
+  else log('PRIMEIRA SYNC', {
+    recebidos: initial.recebidos,
+    novos: initial.novosGuardados,
+    motivoSemSinal: initial.motivoSemSinal
+  });
 
-  timer = setInterval(() => {
-    if (!runtime.sincronizacaoEmCurso && !stopping) {
-      syncOnce();
-    }
-  }, INTERVALO_SYNC_MS);
+  syncTimer = setInterval(async () => {
+    if (runtime.sincronizacaoEmCurso || shuttingDown) return;
+    await syncOnce();
+  }, CONFIG.intervaloSyncMs);
+
+  if (typeof syncTimer.unref === 'function') syncTimer.unref();
 }
 
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
 
-  console.log('[SHUTDOWN]', signal);
-
-  if (timer) clearInterval(timer);
-
-  if (server) {
-    await new Promise(resolve => server.close(resolve));
-  }
-
-  try {
-    await pool.end();
-  } catch (err) {
-    console.error('[DB_CLOSE]', safeError(err));
-  }
+  if (syncTimer) clearInterval(syncTimer);
+  if (server) await new Promise(resolve => server.close(resolve));
+  if (pool) await pool.end();
 
   process.exit(0);
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-
-process.on('unhandledRejection', err => {
-  console.error('[UNHANDLED_REJECTION]', safeError(err));
+process.on('unhandledRejection', (reason) => {
+  log('UNHANDLED REJECTION', String(reason));
 });
 
-start().catch(err => {
-  console.error('[FATAL_STARTUP]', safeError(err));
+process.on('uncaughtException', (error) => {
+  log('UNCAUGHT EXCEPTION', error.message || String(error));
+});
+
+process.on('SIGTERM', () => shutdown().catch(() => process.exit(1)));
+process.on('SIGINT', () => shutdown().catch(() => process.exit(1)));
+
+start().catch((error) => {
+  console.error('[FATAL]', error);
   process.exit(1);
 });
