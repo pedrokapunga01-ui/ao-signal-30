@@ -1,18 +1,16 @@
-
 {
-  "name": "dados-ao-bacbo-bot",
-  "version": "1.0.0",
-  "description": "Bot Telegram para registo e estatísticas descritivas Bac Bo",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "dotenv": "^16.4.7",
-    "node-telegram-bot-api": "^0.66.0"
-  }
+"name": "dados-ao-bacbo-bot",
+"version": "1.0.0",
+"main": "server.js",
+"scripts": {
+"start": "node server.js",
+"check": "node --check server.js"
+},
+"engines": {
+"node": ">=18"
+},
+"dependencies": {
+"dotenv": "^16.4.7",
+"node-telegram-bot-api": "^0.66.0"
+}
 }
