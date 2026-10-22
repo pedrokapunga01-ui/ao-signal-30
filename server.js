@@ -5,17 +5,16 @@
  * CAPUNGA DADOS — BAC BO TELEGRAM SERVER
  * Node.js + Express + PostgreSQL + Axios
  *
- * Importante:
  * - Não inventa sinais para cumprir uma frequência.
  * - Não bloqueia sinais por limite diário de REDs.
- * - Na primeira sincronização, importa o histórico sem publicar resultados antigos.
- * - Só resolve sinais com rodadas novas, nunca com o resultado usado para criar o sinal.
- * - A análise de padrões é descritiva; não garante resultados futuros.
+ * - A primeira sincronização importa o histórico sem publicar sinais antigos.
+ * - Os sinais só são resolvidos com rodadas posteriores à entrada.
+ * - Padrões históricos não garantem resultados futuros.
  *
- * Variáveis necessárias:
+ * Variáveis obrigatórias:
  * DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
  *
- * Opcionais:
+ * Variáveis opcionais:
  * API_BACBO, SINAIS_ATIVOS, STREAK_MIN, MAX_GALE,
  * EMPATE_PROTEGIDO, INTERVALO_MINIMO_MS, SINAL_EXPIRA_MIN,
  * INTERVALO_SYNC_MS, HISTORICO_INICIAL, TELEGRAM_PARSE_MODE
@@ -27,6 +26,7 @@ const axios = require('axios');
 const { Pool } = require('pg');
 
 const app = express();
+
 app.disable('x-powered-by');
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -36,17 +36,23 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+
 const API_BACBO = process.env.API_BACBO ||
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
 
 function boolEnv(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
-  return ['true', '1', 'yes', 'sim', 'on'].includes(String(value).trim().toLowerCase());
+
+  return ['true', '1', 'yes', 'sim', 'on'].includes(
+    String(value).trim().toLowerCase()
+  );
 }
 
 function intEnv(name, fallback, min, max) {
   const n = Number.parseInt(process.env[name], 10);
+
   if (!Number.isFinite(n)) return fallback;
+
   return Math.max(min, Math.min(max, n));
 }
 
@@ -106,7 +112,14 @@ let syncTimer = null;
 let shuttingDown = false;
 
 function log(tag, data) {
-  const payload = typeof data === 'string' ? data : JSON.stringify(data);
+  let payload;
+
+  try {
+    payload = typeof data === 'string' ? data : JSON.stringify(data);
+  } catch {
+    payload = String(data);
+  }
+
   console.log(`[${new Date().toISOString()}] [${tag}] ${payload}`);
 }
 
@@ -123,18 +136,23 @@ function corDisplay(cor) {
   if (cor === 'Banca') return '🔴 BANCA';
   if (cor === 'Jogador') return '🔵 JOGADOR';
   if (cor === 'Empate') return '🟡 EMPATE';
+
   return String(cor || 'N/D');
 }
 
 function oposta(cor) {
   if (cor === 'Banca') return 'Jogador';
   if (cor === 'Jogador') return 'Banca';
+
   return null;
 }
 
 function normalizeOutcome(value) {
   if (value && typeof value === 'object') {
-    value = value.outcome ?? value.resultado ?? value.winner ?? value.name;
+    value = value.outcome ??
+      value.resultado ??
+      value.winner ??
+      value.name;
   }
 
   const s = String(value ?? '')
@@ -144,16 +162,34 @@ function normalizeOutcome(value) {
     .toLowerCase()
     .replace(/[\s_-]+/g, '');
 
-  if (['player', 'jogador', 'playerwin', 'playerwins', 'playerwon', 'playerwinner', 'blue'].includes(s)) return 'Jogador';
-  if (['banker', 'banca', 'bankerwin', 'bankerwins', 'bankerwon', 'bankerwinner', 'red', 'vermelho'].includes(s)) return 'Banca';
-  if (['tie', 'draw', 'empate', 'equal', 'push', 'tied'].includes(s)) return 'Empate';
+  if ([
+    'player', 'jogador', 'playerwin', 'playerwins',
+    'playerwon', 'playerwinner', 'blue'
+  ].includes(s)) {
+    return 'Jogador';
+  }
+
+  if ([
+    'banker', 'banca', 'bankerwin', 'bankerwins',
+    'bankerwon', 'bankerwinner', 'red', 'vermelho'
+  ].includes(s)) {
+    return 'Banca';
+  }
+
+  if ([
+    'tie', 'draw', 'empate', 'equal', 'push', 'tied'
+  ].includes(s)) {
+    return 'Empate';
+  }
 
   return null;
 }
 
 function validDate(value) {
   if (!value) return null;
+
   const d = new Date(value);
+
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
@@ -162,9 +198,18 @@ function extractItems(body) {
   if (!body || typeof body !== 'object') return [];
 
   const candidates = [
-    body.data, body.results, body.items, body.resultados, body.rounds, body.events,
-    body.data?.results, body.data?.items, body.data?.resultados, body.data?.rounds,
-    body.data?.events, body.data?.data
+    body.data,
+    body.results,
+    body.items,
+    body.resultados,
+    body.rounds,
+    body.events,
+    body.data?.results,
+    body.data?.items,
+    body.data?.resultados,
+    body.data?.rounds,
+    body.data?.events,
+    body.data?.data
   ];
 
   return candidates.find(Array.isArray) || [];
@@ -172,54 +217,97 @@ function extractItems(body) {
 
 function normalizeRound(item) {
   const d = item?.data || item?.round || item || {};
+
   const r = d.result && typeof d.result === 'object'
     ? d.result
-    : item?.result && typeof item.result === 'object' ? item.result : {};
+    : item?.result && typeof item.result === 'object'
+      ? item.result
+      : {};
 
-  const status = String(d.status ?? d.estado ?? item?.status ?? item?.estado ?? '').toLowerCase();
+  const status = String(
+    d.status ?? d.estado ?? item?.status ?? item?.estado ?? ''
+  ).toLowerCase();
 
   const inicio = validDate(
-    d.startedAt ?? d.startTime ?? d.started_at ?? d.inicio ??
-    item?.startedAt ?? item?.inicio
+    d.startedAt ??
+    d.startTime ??
+    d.started_at ??
+    d.inicio ??
+    item?.startedAt ??
+    item?.inicio
   );
 
   const fim = validDate(
-    d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ?? d.fim ??
-    item?.settledAt ?? item?.fim
+    d.settledAt ??
+    d.endTime ??
+    d.endedAt ??
+    d.finishedAt ??
+    d.fim ??
+    item?.settledAt ??
+    item?.fim
   );
 
   const rawOutcome =
-    r.outcome ?? r.resultado ?? r.winner ??
-    d.outcome ?? d.resultado ?? d.winner ??
-    item?.outcome ?? item?.resultado ?? item?.winner ??
+    r.outcome ??
+    r.resultado ??
+    r.winner ??
+    d.outcome ??
+    d.resultado ??
+    d.winner ??
+    item?.outcome ??
+    item?.resultado ??
+    item?.winner ??
     (typeof d.result === 'string' ? d.result : null) ??
     (typeof item?.result === 'string' ? item.result : null);
 
   const resultado = normalizeOutcome(rawOutcome);
 
   const resolvida = [
-    'resolved', 'settled', 'finished', 'complete', 'completed',
-    'resolvido', 'concluido', 'finalizado'
+    'resolved',
+    'settled',
+    'finished',
+    'complete',
+    'completed',
+    'resolvido',
+    'concluido',
+    'finalizado'
   ].some((word) => status.includes(word)) || Boolean(fim);
 
   const id = String(
-    d.id ?? d.roundId ?? d.round_id ?? d.eventId ??
-    item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? ''
+    d.id ??
+    d.roundId ??
+    d.round_id ??
+    d.eventId ??
+    item?.id ??
+    item?.roundId ??
+    item?.round_id ??
+    item?.eventId ??
+    ''
   ).trim();
 
   if (!id || !resultado || !resolvida || !fim) return null;
 
   const scoreJogador = Number(
-    r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ??
-    d.player_score ?? d.pontos_jogador
+    r.playerDice?.score ??
+    d.playerDice?.score ??
+    d.playerScore ??
+    d.player_score ??
+    d.pontos_jogador
   );
 
   const scoreBanca = Number(
-    r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ??
-    d.banker_score ?? d.pontos_banca
+    r.bankerDice?.score ??
+    d.bankerDice?.score ??
+    d.bankerScore ??
+    d.banker_score ??
+    d.pontos_banca
   );
 
-  const multiplicador = r.multiplier ?? d.multiplier ?? d.multiplicador ?? null;
+  const multiplicador =
+    r.multiplier ??
+    d.multiplier ??
+    d.multiplicador ??
+    null;
 
   return {
     id,
@@ -227,15 +315,23 @@ function normalizeRound(item) {
     estado: 'Resolved',
     inicio: inicio || fim,
     fim,
-    pontos_jogador: Number.isFinite(scoreJogador) ? scoreJogador : null,
-    pontos_banca: Number.isFinite(scoreBanca) ? scoreBanca : null,
-    multiplicador: multiplicador == null ? null : String(multiplicador)
+    pontos_jogador: Number.isFinite(scoreJogador)
+      ? scoreJogador
+      : null,
+    pontos_banca: Number.isFinite(scoreBanca)
+      ? scoreBanca
+      : null,
+    multiplicador: multiplicador == null
+      ? null
+      : String(multiplicador)
   };
 }
 
 async function telegramSend(texto) {
   if (!BOT_TOKEN || !CHAT_ID) {
-    runtime.ultimoErroTelegram = 'BOT_TOKEN ou CHAT_ID não configurado';
+    runtime.ultimoErroTelegram =
+      'BOT_TOKEN ou CHAT_ID não configurado';
+
     return false;
   }
 
@@ -246,7 +342,9 @@ async function telegramSend(texto) {
       disable_web_page_preview: true
     };
 
-    if (CONFIG.telegramParseMode) payload.parse_mode = CONFIG.telegramParseMode;
+    if (CONFIG.telegramParseMode) {
+      payload.parse_mode = CONFIG.telegramParseMode;
+    }
 
     const response = await axios.post(
       `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -257,10 +355,12 @@ async function telegramSend(texto) {
     if (response.data?.ok === true) {
       runtime.ultimaMensagemTelegram = new Date().toISOString();
       runtime.ultimoErroTelegram = null;
+
       return true;
     }
 
     runtime.ultimoErroTelegram = JSON.stringify(response.data);
+
     return false;
   } catch (error) {
     runtime.ultimoErroTelegram = error.response?.data
@@ -268,12 +368,16 @@ async function telegramSend(texto) {
       : error.message;
 
     console.error('[TELEGRAM]', runtime.ultimoErroTelegram);
+
     return false;
   }
 }
 
 async function ensureSchema() {
-  if (!pool) throw new Error('DATABASE_URL não configurada');
+  if (!pool) {
+    throw new Error('DATABASE_URL não configurada');
+  }
+
   if (schemaPromise) return schemaPromise;
 
   schemaPromise = (async () => {
@@ -292,10 +396,26 @@ async function ensureSchema() {
       )
     `);
 
-    await pool.query(`ALTER TABLE bacbo_resultados ADD COLUMN IF NOT EXISTS seq BIGSERIAL`);
-    await pool.query(`ALTER TABLE bacbo_resultados ADD COLUMN IF NOT EXISTS guardado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_fim ON bacbo_resultados (fim DESC)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bacbo_seq ON bacbo_resultados (seq DESC)`);
+    await pool.query(`
+      ALTER TABLE bacbo_resultados
+      ADD COLUMN IF NOT EXISTS seq BIGSERIAL
+    `);
+
+    await pool.query(`
+      ALTER TABLE bacbo_resultados
+      ADD COLUMN IF NOT EXISTS guardado_em TIMESTAMPTZ
+      NOT NULL DEFAULT NOW()
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_bacbo_fim
+      ON bacbo_resultados (fim DESC)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_bacbo_seq
+      ON bacbo_resultados (seq DESC)
+    `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sinais (
@@ -313,13 +433,41 @@ async function ensureSchema() {
       )
     `);
 
-    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS estrategia TEXT`);
-    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS estrategia_nome TEXT`);
-    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON sinais (criado_em DESC)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_resultado_id ON sinais (resultado_id)`);
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sinais_um_pendente ON sinais ((estado)) WHERE estado = 'PENDENTE'`);
+    await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS estrategia TEXT
+    `);
+
+    await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS estrategia_nome TEXT
+    `);
+
+    await pool.query(`
+      ALTER TABLE sinais
+      ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_sinais_estado
+      ON sinais (estado)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_sinais_criado
+      ON sinais (criado_em DESC)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_sinais_resultado_id
+      ON sinais (resultado_id)
+    `);
+
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sinais_um_pendente
+      ON sinais ((estado))
+      WHERE estado = 'PENDENTE'
+    `);
 
     log('DB', { tabelasPreparadas: true });
   })();
@@ -333,44 +481,76 @@ async function ensureSchema() {
 }
 
 async function fetchRounds() {
-  const response = await axios.get(API_BACBO, {
-    timeout: 20000,
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'CapungaDadosBot/2.0'
+  try {
+    const response = await axios.get(API_BACBO, {
+      timeout: 20000,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'CapungaDadosBot/2.1'
+      }
+    });
+
+    runtime.ultimoHTTPAPI = response.status;
+    runtime.ultimoErroAPI = null;
+
+    const items = extractItems(response.data);
+    const unique = new Map();
+
+    for (const item of items) {
+      const round = normalizeRound(item);
+
+      if (round) unique.set(round.id, round);
     }
-  });
 
-  runtime.ultimoHTTPAPI = response.status;
-  runtime.ultimoErroAPI = null;
+    const rounds = [...unique.values()].sort(
+      (a, b) => new Date(a.fim) - new Date(b.fim)
+    );
 
-  const items = extractItems(response.data);
-  const unique = new Map();
+    runtime.itensRecebidosAPI = items.length;
+    runtime.quantidadeAPI = rounds.length;
+    runtime.ultimaHoraDaAPI = rounds.at(-1)?.fim || null;
 
-  for (const item of items) {
-    const round = normalizeRound(item);
-    if (round) unique.set(round.id, round);
+    if (items.length > 0 && rounds.length === 0) {
+      runtime.ultimoErroAPI =
+        'A API respondeu, mas não foram encontradas rodadas finalizadas reconhecíveis.';
+    }
+
+    return rounds;
+  } catch (error) {
+    runtime.ultimoHTTPAPI = error.response?.status || null;
+    runtime.ultimoErroAPI = error.response?.data
+      ? JSON.stringify(error.response.data)
+      : error.message;
+
+    throw new Error(`Falha na API Bac Bo: ${runtime.ultimoErroAPI}`);
   }
-
-  const rounds = [...unique.values()].sort((a, b) => new Date(a.fim) - new Date(b.fim));
-
-  runtime.itensRecebidosAPI = items.length;
-  runtime.quantidadeAPI = rounds.length;
-  runtime.ultimaHoraDaAPI = rounds.at(-1)?.fim || null;
-
-  return rounds;
 }
 
 async function insertRound(round) {
   const result = await pool.query(
     `INSERT INTO bacbo_resultados
-      (id, resultado, estado, inicio, fim, pontos_jogador, pontos_banca, multiplicador)
+      (
+        id,
+        resultado,
+        estado,
+        inicio,
+        fim,
+        pontos_jogador,
+        pontos_banca,
+        multiplicador
+      )
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (id) DO NOTHING
      RETURNING id`,
     [
-      round.id, round.resultado, round.estado, round.inicio, round.fim,
-      round.pontos_jogador, round.pontos_banca, round.multiplicador
+      round.id,
+      round.resultado,
+      round.estado,
+      round.inicio,
+      round.fim,
+      round.pontos_jogador,
+      round.pontos_banca,
+      round.multiplicador
     ]
   );
 
@@ -390,7 +570,13 @@ async function getLatestFromDB() {
 
 async function getRecentOutcomes(limit = 40) {
   const result = await pool.query(
-    `SELECT id, resultado, fim, pontos_jogador, pontos_banca, multiplicador
+    `SELECT
+       id,
+       resultado,
+       fim,
+       pontos_jogador,
+       pontos_banca,
+       multiplicador
      FROM bacbo_resultados
      WHERE resultado IN ('Jogador', 'Banca')
      ORDER BY fim DESC NULLS LAST, seq DESC
@@ -403,7 +589,13 @@ async function getRecentOutcomes(limit = 40) {
 
 async function getRecentAll(limit = 40) {
   const result = await pool.query(
-    `SELECT id, resultado, fim, pontos_jogador, pontos_banca, multiplicador
+    `SELECT
+       id,
+       resultado,
+       fim,
+       pontos_jogador,
+       pontos_banca,
+       multiplicador
      FROM bacbo_resultados
      ORDER BY fim DESC NULLS LAST, seq DESC
      LIMIT $1`,
@@ -419,6 +611,7 @@ function streakLen(rows) {
   if (!rows.length) return 0;
 
   const color = rows[0].resultado;
+
   if (!['Jogador', 'Banca'].includes(color)) return 0;
 
   let n = 0;
@@ -433,6 +626,7 @@ function streakLen(rows) {
 
 function stratRepeticao(rows) {
   const n = streakLen(rows);
+
   if (n < CONFIG.streakMin) return null;
 
   return {
@@ -446,9 +640,11 @@ function stratRepeticao(rows) {
 
 function stratQuebra(rows) {
   const n = streakLen(rows);
+
   if (n < CONFIG.streakMin + 1) return null;
 
   const cor = oposta(rows[0].resultado);
+
   if (!cor) return null;
 
   return {
@@ -466,14 +662,20 @@ function stratSurf(rows) {
   const a = rows[0].resultado;
   const b = rows[1].resultado;
 
-  if (!['Jogador', 'Banca'].includes(a) || !['Jogador', 'Banca'].includes(b) || a === b) return null;
+  if (
+    !['Jogador', 'Banca'].includes(a) ||
+    !['Jogador', 'Banca'].includes(b) ||
+    a === b
+  ) {
+    return null;
+  }
 
   for (let i = 0; i < 4; i++) {
     const expected = i % 2 === 0 ? a : b;
+
     if (rows[i]?.resultado !== expected) return null;
   }
 
-  // rows[0] é a rodada mais recente; o próximo resultado alternado seria b.
   return {
     cor: b,
     estrategia: 'SURF',
@@ -522,7 +724,10 @@ function stratDoisDois(rows) {
 }
 
 function stratForca(rows) {
-  const sample = rows.slice(0, 12).filter((r) => ['Jogador', 'Banca'].includes(r.resultado));
+  const sample = rows
+    .slice(0, 12)
+    .filter((r) => ['Jogador', 'Banca'].includes(r.resultado));
+
   if (sample.length < 8) return null;
 
   let j = 0;
@@ -568,7 +773,11 @@ function stratNumerica(rows) {
   const pb = Number(last.pontos_banca);
 
   if (Number.isFinite(pj) && Number.isFinite(pb)) {
-    if (last.resultado === 'Jogador' && pj >= 10 && pj > pb) {
+    if (
+      last.resultado === 'Jogador' &&
+      pj >= 10 &&
+      pj > pb
+    ) {
       return {
         cor: 'Jogador',
         estrategia: 'NUMERICA',
@@ -578,7 +787,11 @@ function stratNumerica(rows) {
       };
     }
 
-    if (last.resultado === 'Banca' && pb >= 10 && pb > pj) {
+    if (
+      last.resultado === 'Banca' &&
+      pb >= 10 &&
+      pb > pj
+    ) {
       return {
         cor: 'Banca',
         estrategia: 'NUMERICA',
@@ -608,7 +821,9 @@ function stratNumerica(rows) {
     }
 
     if (!dominantColor) dominantColor = row.resultado;
-    else if (row.resultado !== dominantColor) sameColorWithLargeDiff = false;
+    else if (row.resultado !== dominantColor) {
+      sameColorWithLargeDiff = false;
+    }
   }
 
   if (sameColorWithLargeDiff && dominantColor) {
@@ -629,10 +844,20 @@ function stratNumerica(rows) {
       w0.resultado === w1.resultado &&
       ['Jogador', 'Banca'].includes(w0.resultado)
     ) {
-      const s0 = w0.resultado === 'Jogador' ? Number(w0.pontos_jogador) : Number(w0.pontos_banca);
-      const s1 = w1.resultado === 'Jogador' ? Number(w1.pontos_jogador) : Number(w1.pontos_banca);
+      const s0 = w0.resultado === 'Jogador'
+        ? Number(w0.pontos_jogador)
+        : Number(w0.pontos_banca);
 
-      if (Number.isFinite(s0) && Number.isFinite(s1) && s0 <= 5 && s1 <= 5) {
+      const s1 = w1.resultado === 'Jogador'
+        ? Number(w1.pontos_jogador)
+        : Number(w1.pontos_banca);
+
+      if (
+        Number.isFinite(s0) &&
+        Number.isFinite(s1) &&
+        s0 <= 5 &&
+        s1 <= 5
+      ) {
         return {
           cor: oposta(w0.resultado),
           estrategia: 'NUMERICA',
@@ -671,8 +896,12 @@ function detectBestEntry(rows) {
   };
 
   candidates.sort((a, b) => {
-    if (b.prioridade !== a.prioridade) return b.prioridade - a.prioridade;
-    return (order[b.estrategia] || 0) - (order[a.estrategia] || 0);
+    if (b.prioridade !== a.prioridade) {
+      return b.prioridade - a.prioridade;
+    }
+
+    return (order[b.estrategia] || 0) -
+      (order[a.estrategia] || 0);
   });
 
   return candidates[0];
@@ -691,7 +920,8 @@ async function getPlacarDia() {
       COUNT(*) FILTER (WHERE estado = 'PENDENTE')::int AS pendentes,
       COUNT(*) FILTER (WHERE estado = 'CANCELADO')::int AS cancelados
     FROM sinais
-    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+    WHERE criado_em >=
+      date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
       AT TIME ZONE 'Africa/Luanda'
   `);
 
@@ -702,25 +932,37 @@ async function getPlacarDia() {
   const loss = Number(s.loss || 0);
   const wins = green + g1 + g2;
   const closed = wins + loss;
-  const percent = closed > 0 ? Number(((wins / closed) * 100).toFixed(1)) : 0;
+
+  const percent = closed > 0
+    ? Number(((wins / closed) * 100).toFixed(1))
+    : 0;
 
   const recent = await pool.query(`
-    SELECT estado FROM sinais
-    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+    SELECT estado
+    FROM sinais
+    WHERE criado_em >=
+      date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
       AT TIME ZONE 'Africa/Luanda'
       AND estado IN ('GREEN', 'G1', 'G2', 'LOSS')
-    ORDER BY criado_em DESC, id DESC LIMIT 50
+    ORDER BY criado_em DESC, id DESC
+    LIMIT 50
   `);
 
   let greensSeguidos = 0;
 
   for (const row of recent.rows) {
-    if (['GREEN', 'G1', 'G2'].includes(row.estado)) greensSeguidos++;
-    else break;
+    if (['GREEN', 'G1', 'G2'].includes(row.estado)) {
+      greensSeguidos++;
+    } else {
+      break;
+    }
   }
 
   return {
-    totalSinais: closed + Number(s.pendentes || 0) + Number(s.cancelados || 0),
+    totalSinais:
+      closed +
+      Number(s.pendentes || 0) +
+      Number(s.cancelados || 0),
     green,
     g1,
     g2,
@@ -756,7 +998,8 @@ function formatPlacar(p) {
 
 async function getPendingSignal() {
   const result = await pool.query(`
-    SELECT * FROM sinais
+    SELECT *
+    FROM sinais
     WHERE estado = 'PENDENTE'
     ORDER BY criado_em ASC, id ASC
     LIMIT 1
@@ -769,13 +1012,17 @@ async function expirePendingSignal(signal) {
   if (!signal) return false;
 
   const age = Date.now() - new Date(signal.criado_em).getTime();
+
   if (age < CONFIG.sinalExpiraMin * 60000) return false;
 
-  await pool.query(`
+  const result = await pool.query(`
     UPDATE sinais
     SET estado = 'CANCELADO', resolvido_em = NOW()
     WHERE id = $1 AND estado = 'PENDENTE'
+    RETURNING id
   `, [signal.id]);
+
+  if (!result.rows.length) return false;
 
   await telegramSend([
     '⏰ SINAL CANCELADO POR EXPIRAÇÃO',
@@ -799,7 +1046,11 @@ function msgNovoSinal(entry, signalId) {
     `🆔 Sinal #${signalId}`,
     `🎯 Entrada: ${corDisplay(entry.cor)}`,
     `${entry.emoji} Estratégia: ${entry.nome}`,
-    `🛡️ Proteção: ${CONFIG.empateProtegido ? 'Empate protegido' : 'Sem proteção de empate'}`,
+    `🛡️ Proteção: ${
+      CONFIG.empateProtegido
+        ? 'Empate protegido'
+        : 'Sem proteção de empate'
+    }`,
     `🔁 Gales máximos: ${CONFIG.maxGale}`,
     `🕒 Hora Angola: ${horaAngola()}`,
     '━━━━━━━━━━━━━━━━━━━━',
@@ -810,7 +1061,9 @@ function msgNovoSinal(entry, signalId) {
 function msgResultadoGreen(signal, state) {
   const title = state === 'GREEN'
     ? '✅ GREEN DIRECTO'
-    : state === 'G1' ? '⚡ GREEN NO GALE 1' : '🔥 GREEN NO GALE 2';
+    : state === 'G1'
+      ? '⚡ GREEN NO GALE 1'
+      : '🔥 GREEN NO GALE 2';
 
   return [
     '╔════════════════════╗',
@@ -819,7 +1072,9 @@ function msgResultadoGreen(signal, state) {
     title,
     `🆔 Sinal #${signal.id}`,
     `🎯 Entrada: ${corDisplay(signal.cor)}`,
-    `🧠 Estratégia: ${signal.estrategia_nome || signal.estrategia || 'N/D'}`,
+    `🧠 Estratégia: ${
+      signal.estrategia_nome || signal.estrategia || 'N/D'
+    }`,
     `🐓 Gales usados: ${Number(signal.gale || 0)}`,
     `🕒 ${horaAngola()}`
   ].join('\n');
@@ -833,7 +1088,9 @@ function msgResultadoLoss(signal) {
     '❌ RED FINAL',
     `🆔 Sinal #${signal.id}`,
     `🎯 Entrada: ${corDisplay(signal.cor)}`,
-    `🧠 Estratégia: ${signal.estrategia_nome || signal.estrategia || 'N/D'}`,
+    `🧠 Estratégia: ${
+      signal.estrategia_nome || signal.estrategia || 'N/D'
+    }`,
     `🐓 Gales usados: ${Number(signal.gale || 0)}/${CONFIG.maxGale}`,
     `🕒 ${horaAngola()}`
   ].join('\n');
@@ -846,7 +1103,9 @@ function msgGale(signal, nextGale) {
     '╚════════════════════╝',
     `🆔 Sinal #${signal.id}`,
     `🎯 Manter entrada: ${corDisplay(signal.cor)}`,
-    `🧠 Estratégia: ${signal.estrategia_nome || signal.estrategia || 'N/D'}`,
+    `🧠 Estratégia: ${
+      signal.estrategia_nome || signal.estrategia || 'N/D'
+    }`,
     `🕒 ${horaAngola()}`
   ].join('\n');
 }
@@ -882,16 +1141,19 @@ async function maybeCreateSignal(round) {
   }
 
   const lastResult = await pool.query(`
-    SELECT criado_em FROM sinais
+    SELECT criado_em
+    FROM sinais
     WHERE estado <> 'CANCELADO'
-    ORDER BY criado_em DESC, id DESC LIMIT 1
+    ORDER BY criado_em DESC, id DESC
+    LIMIT 1
   `);
 
   const last = lastResult.rows[0];
 
   if (
     last?.criado_em &&
-    Date.now() - new Date(last.criado_em).getTime() < CONFIG.intervaloMinimoMs
+    Date.now() - new Date(last.criado_em).getTime() <
+      CONFIG.intervaloMinimoMs
   ) {
     runtime.motivoSemSinal = 'intervalo_minimo';
     return;
@@ -901,12 +1163,17 @@ async function maybeCreateSignal(round) {
   const entry = detectBestEntry(rows);
 
   if (!entry) {
-    const recent = rows.slice(0, 6).map((r) => r.resultado[0]).join('');
+    const recent = rows
+      .slice(0, 6)
+      .map((r) => r.resultado[0])
+      .join('');
+
     runtime.motivoSemSinal = `sem_setup[${recent}]`;
+
     return;
   }
 
-  // Não criar mais de um sinal baseado na mesma rodada.
+  // Evita criar mais de um sinal para a mesma rodada.
   const used = await pool.query(
     `SELECT 1 FROM sinais WHERE resultado_id = $1 LIMIT 1`,
     [round.id]
@@ -919,10 +1186,23 @@ async function maybeCreateSignal(round) {
 
   const inserted = await pool.query(`
     INSERT INTO sinais
-      (cor, estado, gale, resultado_id, empates, estrategia, estrategia_nome)
+      (
+        cor,
+        estado,
+        gale,
+        resultado_id,
+        empates,
+        estrategia,
+        estrategia_nome
+      )
     VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4)
     RETURNING *
-  `, [entry.cor, round.id, entry.estrategia, entry.nome]);
+  `, [
+    entry.cor,
+    round.id,
+    entry.estrategia,
+    entry.nome
+  ]);
 
   const signal = inserted.rows[0];
 
@@ -940,16 +1220,29 @@ async function maybeCreateSignal(round) {
 
   const sent = await telegramSend(msgNovoSinal(entry, signal.id));
 
-  if (!sent) log('AVISO', { sinalCriado: signal.id, telegramEnviado: false });
+  if (!sent) {
+    log('AVISO', {
+      sinalCriado: signal.id,
+      telegramEnviado: false,
+      erro: runtime.ultimoErroTelegram
+    });
+  }
 
-  log('SINAL CRIADO', { id: signal.id, cor: entry.cor, estrategia: entry.estrategia });
+  log('SINAL CRIADO', {
+    id: signal.id,
+    cor: entry.cor,
+    estrategia: entry.estrategia
+  });
 }
 
 async function resolvePending(round) {
   const signal = await getPendingSignal();
 
   if (!signal) return;
+
+  // A rodada que originou o sinal nunca pode resolvê-lo.
   if (String(signal.resultado_id) === String(round.id)) return;
+
   if (await expirePendingSignal(signal)) return;
 
   if (round.resultado === 'Empate') {
@@ -962,26 +1255,44 @@ async function resolvePending(round) {
       RETURNING *
     `, [signal.id]);
 
-    if (updated.rows[0]) await telegramSend(msgEmpate(updated.rows[0]));
+    if (updated.rows[0]) {
+      await telegramSend(msgEmpate(updated.rows[0]));
+    }
 
     return;
   }
 
   if (round.resultado === signal.cor) {
     const galeNum = Number(signal.gale || 0);
-    const state = galeNum === 0 ? 'GREEN' : galeNum === 1 ? 'G1' : 'G2';
+
+    const state = galeNum === 0
+      ? 'GREEN'
+      : galeNum === 1
+        ? 'G1'
+        : 'G2';
 
     const updated = await pool.query(`
       UPDATE sinais
-      SET estado = $1, resultado_final = $2, resolvido_em = NOW()
+      SET
+        estado = $1,
+        resultado_final = $2,
+        resolvido_em = NOW()
       WHERE id = $3 AND estado = 'PENDENTE'
       RETURNING *
     `, [state, round.resultado, signal.id]);
 
     if (updated.rows[0]) {
       const placar = await getPlacarDia();
-      await telegramSend(msgResultadoGreen(updated.rows[0], state) + formatPlacar(placar));
-      log('SINAL RESOLVIDO', { id: signal.id, estado: state });
+
+      await telegramSend(
+        msgResultadoGreen(updated.rows[0], state) +
+        formatPlacar(placar)
+      );
+
+      log('SINAL RESOLVIDO', {
+        id: signal.id,
+        estado: state
+      });
     }
 
     return;
@@ -991,14 +1302,19 @@ async function resolvePending(round) {
 
   if (nextGale <= CONFIG.maxGale) {
     const updated = await pool.query(`
-      UPDATE sinais SET gale = $1
+      UPDATE sinais
+      SET gale = $1
       WHERE id = $2 AND estado = 'PENDENTE'
       RETURNING *
     `, [nextGale, signal.id]);
 
     if (updated.rows[0]) {
       await telegramSend(msgGale(updated.rows[0], nextGale));
-      log('GALE', { id: signal.id, gale: nextGale });
+
+      log('GALE', {
+        id: signal.id,
+        gale: nextGale
+      });
     }
 
     return;
@@ -1006,43 +1322,63 @@ async function resolvePending(round) {
 
   const updated = await pool.query(`
     UPDATE sinais
-    SET estado = 'LOSS', resultado_final = $1, resolvido_em = NOW()
+    SET
+      estado = 'LOSS',
+      resultado_final = $1,
+      resolvido_em = NOW()
     WHERE id = $2 AND estado = 'PENDENTE'
     RETURNING *
   `, [round.resultado, signal.id]);
 
   if (updated.rows[0]) {
     const placar = await getPlacarDia();
-    await telegramSend(msgResultadoLoss(updated.rows[0]) + formatPlacar(placar));
+
+    await telegramSend(
+      msgResultadoLoss(updated.rows[0]) +
+      formatPlacar(placar)
+    );
+
     log('SINAL RED', { id: signal.id });
   }
 }
 
 /**
- * Inicialização:
- * 1) Se a tabela estiver vazia, importa o histórico existente como base e não cria sinais.
- * 2) Nas sincronizações seguintes, só rodadas realmente novas são processadas.
- * 3) Rodadas novas são processadas por ordem cronológica.
+ * Primeira sincronização:
+ * - Importa o histórico disponível sem publicar resultados antigos.
+ *
+ * Sincronizações seguintes:
+ * - Guardam apenas rodadas que ainda não existam na base.
+ * - Processam as rodadas novas por ordem cronológica.
  */
 async function syncOnce() {
-  if (!pool) throw new Error('DATABASE_URL não configurada');
+  if (!pool) {
+    throw new Error('DATABASE_URL não configurada');
+  }
 
   if (runtime.sincronizacaoEmCurso || shuttingDown) {
-    return { sucesso: false, ignorada: true };
+    return {
+      sucesso: false,
+      ignorada: true
+    };
   }
 
   runtime.sincronizacaoEmCurso = true;
+
   const started = Date.now();
 
   try {
     await ensureSchema();
 
-    const countBefore = await pool.query(`SELECT COUNT(*)::int AS total FROM bacbo_resultados`);
+    const countBefore = await pool.query(`
+      SELECT COUNT(*)::int AS total
+      FROM bacbo_resultados
+    `);
+
     const hadHistory = Number(countBefore.rows[0].total) > 0;
     const rounds = await fetchRounds();
 
     let inserted = 0;
-    let duplicates = 0;
+    let duplicados = 0;
     let evaluated = 0;
     let lastNew = null;
 
@@ -1050,7 +1386,7 @@ async function syncOnce() {
       const saved = await insertRound(round);
 
       if (!saved) {
-        duplicates++;
+        duplicados++;
         continue;
       }
 
@@ -1064,22 +1400,26 @@ async function syncOnce() {
       }
     }
 
-    // A primeira execução apenas estabelece a base histórica.
     if (!hadHistory && inserted > 0) {
       log('BASE HISTÓRICA CRIADA', {
         importados: inserted,
         sinaisAntigosPublicados: false,
-        nota: 'Sinais começam a ser avaliados após a chegada de novas rodadas.'
+        nota: 'Os sinais começam a ser avaliados após a chegada de novas rodadas.'
       });
 
       runtime.motivoSemSinal = 'a_inicializar_base_historica';
     } else if (inserted === 0) {
-      runtime.ciclosSemNovos += 1;
+      runtime.ciclosSemNovos++;
 
       const pending = await getPendingSignal();
-      if (pending) await expirePendingSignal(pending);
 
-      if (!runtime.motivoSemSinal) runtime.motivoSemSinal = 'a_aguardar_nova_rodada_da_api';
+      if (pending) {
+        await expirePendingSignal(pending);
+      }
+
+      if (!runtime.motivoSemSinal) {
+        runtime.motivoSemSinal = 'a_aguardar_nova_rodada_da_api';
+      }
     } else {
       runtime.ciclosSemNovos = 0;
     }
@@ -1090,7 +1430,7 @@ async function syncOnce() {
     runtime.ultimoIdDB = latest?.id || null;
     runtime.sincronizacaoInicialConcluida = true;
     runtime.ultimaSincronizacao = new Date().toISOString();
-    runtime.duplicadosUltimoCiclo = duplicates;
+    runtime.duplicadosUltimoCiclo = duplicados;
     runtime.novosUltimoCiclo = inserted;
     runtime.erroSincronizacao = null;
     runtime.ultimaDuracaoSyncMs = Date.now() - started;
@@ -1100,10 +1440,12 @@ async function syncOnce() {
       runtime.ultimoIdNovo = lastNew.id;
     }
 
+    // CORREÇÃO: usar sempre o identificador "duplicados".
+    // Evita ReferenceError por misturar "duplicates" e "duplicados".
     const summary = {
       recebidos: rounds.length,
       novosGuardados: inserted,
-      duplicados,
+      duplicados: duplicados,
       sinaisAvaliados: evaluated,
       motivoSemSinal: runtime.motivoSemSinal,
       ultimaEstrategia: runtime.ultimaEstrategia?.estrategia || null,
@@ -1112,16 +1454,27 @@ async function syncOnce() {
       horaAngola: horaAngola()
     };
 
-    if (inserted > 0 || runtime.ciclosSemNovos % 8 === 0) log('SINCRONIZACAO', summary);
+    if (inserted > 0 || runtime.ciclosSemNovos % 8 === 0) {
+      log('SINCRONIZACAO', summary);
+    }
 
-    return { sucesso: true, ...summary };
+    return {
+      sucesso: true,
+      ...summary
+    };
   } catch (error) {
     runtime.erroSincronizacao = error.message || String(error);
     runtime.ultimaDuracaoSyncMs = Date.now() - started;
 
-    console.error('[ERRO SINCRONIZACAO]', runtime.erroSincronizacao);
+    console.error('[ERRO SINCRONIZACAO]', {
+      mensagem: runtime.erroSincronizacao,
+      stack: error.stack || null
+    });
 
-    return { sucesso: false, erro: runtime.erroSincronizacao };
+    return {
+      sucesso: false,
+      erro: runtime.erroSincronizacao
+    };
   } finally {
     runtime.sincronizacaoEmCurso = false;
   }
@@ -1129,25 +1482,46 @@ async function syncOnce() {
 
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
-    return res.status(503).json({ sucesso: false, erro: 'ADMIN_TOKEN não configurado' });
+    return res.status(503).json({
+      sucesso: false,
+      erro: 'ADMIN_TOKEN não configurado'
+    });
   }
 
   if (req.get('x-admin-token') !== ADMIN_TOKEN) {
-    return res.status(401).json({ sucesso: false, erro: 'Token inválido' });
+    return res.status(401).json({
+      sucesso: false,
+      erro: 'Token inválido'
+    });
   }
 
   next();
 }
+
+/* ======================== ROTAS HTTP ======================== */
 
 app.get('/', (_req, res) => {
   res.json({
     nome: 'Capunga Dados — BAC BO Telegram',
     estado: 'online',
     horaAngola: horaAngola(),
-    estrategia: ['REPETICAO', 'QUEBRA', 'SURF', 'DOIS_DOIS', 'FORCA', 'NUMERICA'],
+    estrategia: [
+      'REPETICAO',
+      'QUEBRA',
+      'SURF',
+      'DOIS_DOIS',
+      'FORCA',
+      'NUMERICA'
+    ],
     limitesReds: false,
-    modo: 'sinais apenas quando existe configuração elegível',
-    rotas: ['/health', '/diagnostico', '/resultados', '/sinais', '/estatisticas']
+    modo: 'Sinais apenas quando existe configuração elegível',
+    rotas: [
+      '/health',
+      '/diagnostico',
+      '/resultados',
+      '/sinais',
+      '/estatisticas'
+    ]
   });
 });
 
@@ -1161,6 +1535,7 @@ app.get('/health', (_req, res) => {
     ultimaRodadaNova: runtime.ultimaRodadaNova,
     ultimoIdNovo: runtime.ultimoIdNovo,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
+    duplicadosUltimoCiclo: runtime.duplicadosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
     motivoSemSinal: runtime.motivoSemSinal,
     erroSincronizacao: runtime.erroSincronizacao,
@@ -1177,36 +1552,68 @@ app.get('/diagnostico', async (_req, res) => {
   let totalSinais = 0;
   let pendentes = 0;
   let recentes = [];
+  let erroDB = null;
 
   try {
     if (pool) {
       await ensureSchema();
 
       const r1 = await pool.query(`
-        SELECT id, resultado, fim, pontos_jogador, pontos_banca
-        FROM bacbo_resultados ORDER BY fim DESC NULLS LAST, seq DESC LIMIT 1
+        SELECT
+          id,
+          resultado,
+          fim,
+          pontos_jogador,
+          pontos_banca
+        FROM bacbo_resultados
+        ORDER BY fim DESC NULLS LAST, seq DESC
+        LIMIT 1
       `);
 
       ultimoResultadoDB = r1.rows[0] || null;
 
-      totalResultados = Number((await pool.query('SELECT COUNT(*)::int AS total FROM bacbo_resultados')).rows[0].total);
-      totalSinais = Number((await pool.query('SELECT COUNT(*)::int AS total FROM sinais')).rows[0].total);
+      totalResultados = Number(
+        (await pool.query(`
+          SELECT COUNT(*)::int AS total
+          FROM bacbo_resultados
+        `)).rows[0].total
+      );
 
-      pendentes = Number((await pool.query(`SELECT COUNT(*)::int AS total FROM sinais WHERE estado = 'PENDENTE'`)).rows[0].total);
+      totalSinais = Number(
+        (await pool.query(`
+          SELECT COUNT(*)::int AS total
+          FROM sinais
+        `)).rows[0].total
+      );
+
+      pendentes = Number(
+        (await pool.query(`
+          SELECT COUNT(*)::int AS total
+          FROM sinais
+          WHERE estado = 'PENDENTE'
+        `)).rows[0].total
+      );
 
       recentes = (await pool.query(`
-        SELECT resultado, pontos_jogador, pontos_banca, fim
+        SELECT
+          resultado,
+          pontos_jogador,
+          pontos_banca,
+          fim
         FROM bacbo_resultados
-        WHERE resultado IN ('Jogador','Banca','Empate')
-        ORDER BY fim DESC NULLS LAST, seq DESC LIMIT 12
+        WHERE resultado IN ('Jogador', 'Banca', 'Empate')
+        ORDER BY fim DESC NULLS LAST, seq DESC
+        LIMIT 12
       `)).rows;
     }
   } catch (error) {
-    runtime.erroSincronizacao = runtime.erroSincronizacao || error.message;
+    erroDB = error.message;
+    runtime.erroSincronizacao =
+      runtime.erroSincronizacao || error.message;
   }
 
   res.json({
-    sucesso: true,
+    sucesso: !erroDB,
     nome: 'Capunga Dados — BAC BO Telegram',
     iniciadoEm: runtime.iniciadoEm,
     horaAngola: horaAngola(),
@@ -1214,15 +1621,22 @@ app.get('/diagnostico', async (_req, res) => {
     databaseConfigurada: Boolean(DATABASE_URL),
     httpAPI: runtime.ultimoHTTPAPI,
     erroAPI: runtime.ultimoErroAPI,
+    erroDB,
     ultimaSincronizacao: runtime.ultimaSincronizacao,
     ultimaRodadaNova: runtime.ultimaRodadaNova,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
+    duplicadosUltimoCiclo: runtime.duplicadosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
     motivoSemSinal: runtime.motivoSemSinal,
     ultimoSinal: runtime.ultimoSinal,
     ultimaEstrategia: runtime.ultimaEstrategia,
     ultimosResultados: recentes,
-    baseDados: { totalResultados, totalSinais, pendentes, ultimoResultadoDB },
+    baseDados: {
+      totalResultados,
+      totalSinais,
+      pendentes,
+      ultimoResultadoDB
+    },
     configuracao: CONFIG
   });
 });
@@ -1231,17 +1645,37 @@ app.get('/resultados', async (req, res) => {
   try {
     await ensureSchema();
 
-    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), 500);
+    const limit = Math.min(
+      Math.max(Number.parseInt(req.query.limit, 10) || 50, 1),
+      500
+    );
 
     const result = await pool.query(`
-      SELECT id, resultado, estado, inicio, fim, pontos_jogador, pontos_banca, multiplicador, guardado_em
+      SELECT
+        id,
+        resultado,
+        estado,
+        inicio,
+        fim,
+        pontos_jogador,
+        pontos_banca,
+        multiplicador,
+        guardado_em
       FROM bacbo_resultados
-      ORDER BY fim DESC NULLS LAST, seq DESC LIMIT $1
+      ORDER BY fim DESC NULLS LAST, seq DESC
+      LIMIT $1
     `, [limit]);
 
-    res.json({ sucesso: true, total: result.rows.length, resultados: result.rows });
+    res.json({
+      sucesso: true,
+      total: result.rows.length,
+      resultados: result.rows
+    });
   } catch (error) {
-    res.status(500).json({ sucesso: false, erro: error.message });
+    res.status(500).json({
+      sucesso: false,
+      erro: error.message
+    });
   }
 });
 
@@ -1249,15 +1683,28 @@ app.get('/sinais', async (req, res) => {
   try {
     await ensureSchema();
 
-    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), 500);
+    const limit = Math.min(
+      Math.max(Number.parseInt(req.query.limit, 10) || 50, 1),
+      500
+    );
 
     const result = await pool.query(`
-      SELECT * FROM sinais ORDER BY criado_em DESC, id DESC LIMIT $1
+      SELECT *
+      FROM sinais
+      ORDER BY criado_em DESC, id DESC
+      LIMIT $1
     `, [limit]);
 
-    res.json({ sucesso: true, total: result.rows.length, sinais: result.rows });
+    res.json({
+      sucesso: true,
+      total: result.rows.length,
+      sinais: result.rows
+    });
   } catch (error) {
-    res.status(500).json({ sucesso: false, erro: error.message });
+    res.status(500).json({
+      sucesso: false,
+      erro: error.message
+    });
   }
 });
 
@@ -1279,9 +1726,17 @@ app.get('/estatisticas', async (_req, res) => {
     `);
 
     const stats = result.rows[0];
-    const wins = Number(stats.green || 0) + Number(stats.g1 || 0) + Number(stats.g2 || 0);
+
+    const wins =
+      Number(stats.green || 0) +
+      Number(stats.g1 || 0) +
+      Number(stats.g2 || 0);
+
     const finalized = wins + Number(stats.loss || 0);
-    const rate = finalized > 0 ? Number(((wins / finalized) * 100).toFixed(1)) : null;
+
+    const rate = finalized > 0
+      ? Number(((wins / finalized) * 100).toFixed(1))
+      : null;
 
     const byStrategy = (await pool.query(`
       SELECT
@@ -1291,7 +1746,9 @@ app.get('/estatisticas', async (_req, res) => {
         COUNT(*) FILTER (WHERE estado = 'G1')::int AS g1,
         COUNT(*) FILTER (WHERE estado = 'G2')::int AS g2,
         COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS reds,
-        COUNT(*) FILTER (WHERE estado IN ('GREEN','G1','G2'))::int AS acertos
+        COUNT(*) FILTER (
+          WHERE estado IN ('GREEN', 'G1', 'G2')
+        )::int AS acertos
       FROM sinais
       GROUP BY 1
       ORDER BY total DESC
@@ -1312,25 +1769,39 @@ app.get('/estatisticas', async (_req, res) => {
       horaAngola: horaAngola()
     });
   } catch (error) {
-    res.status(500).json({ sucesso: false, erro: error.message });
+    res.status(500).json({
+      sucesso: false,
+      erro: error.message
+    });
   }
 });
 
 app.post('/db/preparar', requireAdmin, async (_req, res) => {
   try {
     await ensureSchema();
-    res.json({ sucesso: true, mensagem: 'Tabelas preparadas' });
+
+    res.json({
+      sucesso: true,
+      mensagem: 'Tabelas preparadas'
+    });
   } catch (error) {
-    res.status(500).json({ sucesso: false, erro: error.message });
+    res.status(500).json({
+      sucesso: false,
+      erro: error.message
+    });
   }
 });
 
 app.post('/db/sincronizar', requireAdmin, async (_req, res) => {
   try {
     const result = await syncOnce();
+
     res.status(result.sucesso ? 200 : 500).json(result);
   } catch (error) {
-    res.status(500).json({ sucesso: false, erro: error.message || String(error) });
+    res.status(500).json({
+      sucesso: false,
+      erro: error.message || String(error)
+    });
   }
 });
 
@@ -1343,7 +1814,10 @@ app.post('/telegram/teste', requireAdmin, async (_req, res) => {
     `🕒 ${horaAngola()}`
   ].join('\n'));
 
-  res.status(sent ? 200 : 502).json({ sucesso: sent, erro: runtime.ultimoErroTelegram });
+  res.status(sent ? 200 : 502).json({
+    sucesso: sent,
+    erro: runtime.ultimoErroTelegram
+  });
 });
 
 app.use((req, res) => {
@@ -1354,8 +1828,12 @@ app.use((req, res) => {
   });
 });
 
+/* ======================== ARRANQUE ======================== */
+
 async function start() {
-  if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada no Render');
+  if (!DATABASE_URL) {
+    throw new Error('DATABASE_URL não configurada no Render');
+  }
 
   await ensureSchema();
 
@@ -1372,22 +1850,39 @@ async function start() {
     });
   });
 
-  // Primeiro ciclo estabelece ou atualiza a base; resultados antigos não são publicados.
+  // A primeira sincronização cria ou atualiza a base histórica.
+  // Não publica sinais retroativos.
   const initial = await syncOnce();
 
-  if (!initial.sucesso) log('PRIMEIRA SYNC COM ERRO', initial.erro || initial);
-  else log('PRIMEIRA SYNC', {
-    recebidos: initial.recebidos,
-    novos: initial.novosGuardados,
-    motivoSemSinal: initial.motivoSemSinal
-  });
+  if (!initial.sucesso) {
+    log('PRIMEIRA SYNC COM ERRO', initial.erro || initial);
+  } else {
+    log('PRIMEIRA SYNC', {
+      recebidos: initial.recebidos,
+      novos: initial.novosGuardados,
+      duplicados: initial.duplicados,
+      motivoSemSinal: initial.motivoSemSinal
+    });
+  }
 
   syncTimer = setInterval(async () => {
     if (runtime.sincronizacaoEmCurso || shuttingDown) return;
-    await syncOnce();
+
+    try {
+      await syncOnce();
+    } catch (error) {
+      runtime.erroSincronizacao = error.message || String(error);
+
+      console.error(
+        '[ERRO CICLO AUTOMÁTICO]',
+        runtime.erroSincronizacao
+      );
+    }
   }, CONFIG.intervaloSyncMs);
 
-  if (typeof syncTimer.unref === 'function') syncTimer.unref();
+  if (typeof syncTimer.unref === 'function') {
+    syncTimer.unref();
+  }
 }
 
 process.on('unhandledRejection', (reason) => {
@@ -1403,15 +1898,34 @@ async function shutdown() {
 
   shuttingDown = true;
 
-  if (syncTimer) clearInterval(syncTimer);
-  if (server) await new Promise((resolve) => server.close(resolve));
-  if (pool) await pool.end();
+  if (syncTimer) {
+    clearInterval(syncTimer);
+  }
+
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  if (pool) {
+    await pool.end();
+  }
 
   process.exit(0);
 }
 
-process.on('SIGTERM', () => shutdown().catch(() => process.exit(1)));
-process.on('SIGINT', () => shutdown().catch(() => process.exit(1)));
+process.on('SIGTERM', () => {
+  shutdown().catch((error) => {
+    console.error('[ERRO SIGTERM]', error);
+    process.exit(1);
+  });
+});
+
+process.on('SIGINT', () => {
+  shutdown().catch((error) => {
+    console.error('[ERRO SIGINT]', error);
+    process.exit(1);
+  });
+});
 
 start().catch((error) => {
   console.error('[FATAL]', error);
