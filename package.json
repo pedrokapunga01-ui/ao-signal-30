@@ -1,18 +1,12 @@
 {
-  "name": "capunga-dados-bacbo-telegram",
-  "version": "5.0.0",
-  "description": "Robô de sinais Bac Bo (Evolution) → Telegram",
+  "name": "capunga-bacbo",
+  "version": "6.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "axios": "^1.7.9",
-    "cors": "^2.8.5",
-    "express": "^4.21.2",
-    "pg": "^8.13.1"
+    "axios": "^1.7.0",
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
   }
 }
