@@ -11,4 +11,4 @@ jobs:
     steps:
       - name: Ping Render
         run: |
-          curl -s -o /dev/null -w "%{http_code}" https://teu-app.onrender.com/health
+          curl -s -o /dev/null -w "%{http_code}" https://ao-signal-30.onrender.com/health
