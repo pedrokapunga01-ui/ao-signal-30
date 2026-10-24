@@ -15,7 +15,7 @@
  *  - Fila de Telegram com retry (nenhuma mensagem se perde).
  *
  * Variáveis: BOT_TOKEN, CHAT_ID (obrigatórias p/ enviar) · DATABASE_URL (opcional)
- *  ADMIN_TOKEN · INTERVALO_SINAL_MS (120000) · MIN_CONFIANCA (70) · MIN_AMOSTRA (60)
+ *  ADMIN_TOKEN · INTERVALO_SINAL_MS (180000) · MIN_CONFIANCA (76) · MIN_AMOSTRA (150) · CONSENSO_MIN (2)
  *  SYNC_MS (4000) · SINAL_EXPIRA_MIN (8) · SINAL_INICIAL (1704) · SINAIS_ATIVOS · API_BACBO
  *  O bot precisa de ser ADMIN do canal com permissão de apagar mensagens.
  */
@@ -44,9 +44,10 @@ const API_BACBO =
 const MAX_GALE = 1; // fixo: sinais vão até Gale 1
 const CFG = {
   ativos: bool(process.env.SINAIS_ATIVOS, true),
-  intervaloSinalMs: num('INTERVALO_SINAL_MS', 120000, 0, 3600000),
-  minConf: num('MIN_CONFIANCA', 70, 0, 99),
-  minAmostra: num('MIN_AMOSTRA', 60, 20, 5000),
+  intervaloSinalMs: num('INTERVALO_SINAL_MS', 180000, 0, 3600000),
+  minConf: num('MIN_CONFIANCA', 76, 0, 99),
+  consensoMin: num('CONSENSO_MIN', 2, 1, 6),
+  minAmostra: num('MIN_AMOSTRA', 150, 20, 5000),
   syncMs: num('SYNC_MS', 4000, 2000, 30000),
   expiraMin: num('SINAL_EXPIRA_MIN', 8, 3, 120),
   sinalInicial: num('SINAL_INICIAL', 1704, 1, 100000000),
@@ -472,6 +473,7 @@ function pickEntry(rows) {
 
   const arr = sJ > sB ? grupos[J] : grupos[B];
   arr.sort((a, b) => b.confianca - a.confianca || b.amostra - a.amostra);
+  if (arr.length < CFG.consensoMin) return null; // exige vários padrões na mesma cor
   return { ...arr[0], consenso: arr.length };
 }
 
@@ -725,33 +727,28 @@ function placar() {
 
 function msgPlacar(p) {
   return [
-    '┌─ 📊 <b>BALANÇO DE HOJE</b>',
-    `├ ✅ ${p.wins} Greens  ·  🟥 ${p.loss} Reds  ·  <b>${p.taxa.toFixed(1)}%</b>`,
+    '┌─ <b>BALANÇO DE HOJE</b>',
+    `├ ✅ ${p.wins} Greens  ·  ❌ ${p.loss} Reds  ·  <b>${p.taxa.toFixed(1)}%</b>`,
     `├ Direto ${p.green}  ·  Gale 1: ${p.g1}  ·  🟡 Empate: ${p.emp} <i>(E0 ${p.emp0} · E1 ${p.emp1})</i>`,
     `├ Sem contar empates: ${p.taxaSem.toFixed(1)}%`,
-    `└ 🔥 Greens seguidos: ${p.seguidos}`
+    `└ Greens seguidos: ${p.seguidos}`
   ].join('\n');
 }
 
 function msgEntrada(s) {
-  const nivel = s.confianca >= 80 ? '💎 Forte' : s.confianca >= 75 ? '🟢 Boa' : '🟡 Moderada';
   return [
     '┏━━━ 🎲 <b>CAPUNGA · BAC BO</b> ━━━┓',
-    `🎯 <b>SINAL #${s.id}</b>`,
+    `<b>SINAL #${s.id}</b>`,
     '',
-    `👉 Entrar: ${corTxt(s.cor)}`,
+    `Entrar: ${corTxt(s.cor)}`,
     '🔁 Máximo: <b>Gale 1</b>',
     '🟡 Empate só vale Green se você cobrir o empate',
     '',
-    `${s.emoji || '🧠'} Padrão: ${esc(s.nome)}`,
-    `📊 Histórico do padrão: ${s.taxa}% em ${s.amostra} casos`,
-    `🔒 Confiança (piso estatístico): <b>${s.confianca}%</b>  ${nivel}`,
-    s.consenso > 1 ? `🤝 ${s.consenso} padrões na mesma cor` : null,
-    '',
-    `⏱ ${hora(s.criadoMs)} · Angola`,
+    `Confiança: <b>${s.confianca}%</b>`,
+    `Hora: ${hora(s.criadoMs)} (Angola)`,
     '┗━━━━━━━━━━━━━━━━━━━━┛',
     '<i>Sem garantia: cada rodada é independente. Faça gestão de banca.</i>'
-  ].filter((x) => x !== null).join('\n');
+  ].join('\n');
 }
 
 function placarDados(r) {
@@ -761,8 +758,8 @@ function placarDados(r) {
 function msgGale(s, r) {
   return [
     `⚠️ <b>GALE 1</b>  ·  #${s.id}`,
-    `Rodada anterior: ${corCurta(r.resultado)}${placarDados(r)}`,
-    `👉 Repita: ${corTxt(s.cor)}`,
+    `Saiu ${corCurta(r.resultado)}${placarDados(r)}`,
+    `Repita: ${corTxt(s.cor)}`,
     '<i>(esta mensagem some quando o sinal fechar)</i>'
   ].join('\n');
 }
@@ -777,23 +774,23 @@ function msgGreen(s, r) {
   let extra = null;
   if (s.estado === 'EMPATE') {
     const g = s.empateGale === 0 ? 'ENTRADA DIRETA' : 'GALE 1';
-    titulo = `🟡✅ <b>GREEN POR EMPATE</b> · ${g}`;
+    titulo = `✅ <b>GREEN POR EMPATE</b> · ${g}`;
     extra = [
       `🟡 Empate na <b>${s.empateGale === 0 ? 'entrada direta' : 'Gale 1'}</b>${hasScore(r) ? `  ·  soma ${r.pj} × ${r.pb}` : ''}`,
-      `💰 Multiplicador do empate: <b>${multTxt(r.mult)}</b>`,
+      `Multiplicador do empate: <b>${multTxt(r.mult)}</b>`,
       '<i>Só paga o multiplicador quem apostou no EMPATE; na Banca/Jogador o empate não é vitória.</i>'
     ].join('\n');
   } else if (s.estado === 'GREEN') {
     titulo = '✅ <b>GREEN · ENTRADA DIRETA</b>';
   } else {
-    titulo = '⚡✅ <b>GREEN · GALE 1</b>';
+    titulo = '✅ <b>GREEN · GALE 1</b>';
   }
   return [
     `${titulo}  ·  #${s.id}`,
-    `🎯 ${corCurta(s.cor)}  →  saiu ${corCurta(r.resultado)}${placarDados(r)}`,
+    `${corCurta(s.cor)}  →  saiu ${corCurta(r.resultado)}${placarDados(r)}`,
     extra,
-    `${s.emoji || '🧠'} ${esc(s.nome)}  ·  piso ${s.confianca}%`,
-    `⏱ ${hora()}`,
+    `Confiança do sinal: ${s.confianca}%`,
+    `Hora: ${hora()}`,
     '',
     msgPlacar(placar())
   ].filter((x) => x !== null).join('\n');
@@ -801,11 +798,11 @@ function msgGreen(s, r) {
 
 function msgRed(s, r) {
   return [
-    `🟥 <b>RED</b>  ·  #${s.id}`,
-    `🎯 ${corCurta(s.cor)}  →  saiu ${corCurta(r.resultado)}${placarDados(r)}`,
-    `${s.emoji || '🧠'} ${esc(s.nome)}  ·  piso ${s.confianca}%`,
-    `🔁 Gale 1 usado sem acerto`,
-    `⏱ ${hora()}`,
+    `❌ <b>RED</b>  ·  #${s.id}`,
+    `${corCurta(s.cor)}  →  saiu ${corCurta(r.resultado)}${placarDados(r)}`,
+    'Gale 1 usado sem acerto',
+    `Confiança do sinal: ${s.confianca}%`,
+    `Hora: ${hora()}`,
     '',
     msgPlacar(placar())
   ].join('\n');
@@ -822,7 +819,7 @@ function cancelarSeExpirado() {
   s.estado = 'CANCELADO';
   s.resolvidoMs = Date.now();
   dbSaveSignal(s);
-  tgSend(`⏰ <b>SINAL #${s.id} CANCELADO</b>\nSem rodadas novas da mesa. Não conta no balanço.\n⏱ ${hora()}`);
+  tgSend(`⚠️ <b>SINAL #${s.id} CANCELADO</b>\nSem rodadas novas da mesa. Não conta no balanço.\nHora: ${hora()}`);
   tgApagarGale(s);
   log('SINAL_EXPIRADO', { id: s.id });
   return true;
@@ -1000,7 +997,7 @@ app.get('/', (_req, res) =>
     estado: 'online',
     horaAngola: hora(),
     estrategias: STRATS.length,
-    rotas: ['/health', '/diagnostico', '/sinais', '/estatisticas']
+    rotas: ['/health', '/diagnostico', '/sinais', '/estatisticas', '/estatisticas/horas']
   })
 );
 
@@ -1060,10 +1057,114 @@ app.get('/estatisticas', (_req, res) => {
   res.json({ sucesso: true, placarDia: placar(), taxaBasePercent: st.baseRate ? Number((st.baseRate * 100).toFixed(1)) : null, aviso: 'Nenhum padrão é 100%. pisoConfianca = limite inferior estatístico.', backtest, ao_vivo_por_estrategia: porEstrategia });
 });
 
+/* ---------- relatório por hora do dia (descritivo; não prevê nada) ---------- */
+
+function wilsonCI(w, n, z = 1.96) {
+  if (!n) return [0, 0];
+  const p = w / n;
+  const z2 = z * z;
+  const c = p + z2 / (2 * n);
+  const m = z * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n));
+  const d = 1 + z2 / n;
+  return [(c - m) / d, (c + m) / d];
+}
+
+/** rows: [{ h, green, g1, emp, loss }] por hora (0-23) */
+function calcHoras(rows) {
+  const porH = Array.from({ length: 24 }, (_, h) => ({ h, green: 0, g1: 0, emp: 0, loss: 0 }));
+  for (const r of rows) {
+    const o = porH[r.h];
+    o.green += r.green; o.g1 += r.g1; o.emp += r.emp; o.loss += r.loss;
+  }
+  let W = 0, N = 0;
+  for (const o of porH) { W += o.green + o.g1 + o.emp; N += o.green + o.g1 + o.emp + o.loss; }
+  const media = N ? W / N : null;
+
+  const horas = porH.map((o) => {
+    const wins = o.green + o.g1 + o.emp;
+    const n = wins + o.loss;
+    const base = o.green + o.g1 + o.loss;
+    const [lo, hi] = wilsonCI(wins, n);
+    let leitura;
+    if (n < 30) leitura = 'amostra insuficiente';
+    else if (media != null && lo <= media && media <= hi) leitura = 'indistinguível da média (ruído)';
+    else leitura = hi < media ? 'abaixo da média (pode ser sorte)' : 'acima da média (pode ser sorte)';
+    return {
+      hora: `${String(o.h).padStart(2, '0')}h`,
+      sinais: n,
+      greens: wins,
+      reds: o.loss,
+      empates: o.emp,
+      acertoPercent: n ? Number(((wins / n) * 100).toFixed(1)) : null,
+      acertoSemEmpatesPercent: base ? Number((((o.green + o.g1) / base) * 100).toFixed(1)) : null,
+      margem95Percent: n ? [Number((lo * 100).toFixed(1)), Number((hi * 100).toFixed(1))] : null,
+      leitura
+    };
+  });
+  return { total: N, mediaPercent: media == null ? null : Number((media * 100).toFixed(1)), horas };
+}
+
+async function horasFonte() {
+  if (pool) {
+    await dbChain;
+    const q = await pool.query(`
+      SELECT EXTRACT(HOUR FROM criado_em AT TIME ZONE 'Africa/Luanda')::int AS h,
+        COUNT(*) FILTER (WHERE estado = 'GREEN')::int AS green,
+        COUNT(*) FILTER (WHERE estado IN ('G1','G2'))::int AS g1,
+        COUNT(*) FILTER (WHERE estado = 'EMPATE')::int AS emp,
+        COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss
+      FROM bb_sinais GROUP BY 1`);
+    return { fonte: 'banco de dados (todos os sinais)', rows: q.rows };
+  }
+  const fh = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Luanda', hour: '2-digit', hour12: false });
+  const mapa = {};
+  for (const x of S.signals) {
+    if (!FECHADOS.includes(x.estado)) continue;
+    const h = Number(fh.format(new Date(x.criadoMs))) % 24;
+    const o = mapa[h] || (mapa[h] = { h, green: 0, g1: 0, emp: 0, loss: 0 });
+    if (x.estado === 'GREEN') o.green++;
+    else if (x.estado === 'G1') o.g1++;
+    else if (x.estado === 'EMPATE') o.emp++;
+    else o.loss++;
+  }
+  return { fonte: 'memória (sem banco: só os últimos sinais)', rows: Object.values(mapa) };
+}
+
+app.get('/estatisticas/horas', async (req, res) => {
+  try {
+    const { fonte, rows } = await horasFonte();
+    const r = calcHoras(rows);
+    const aviso =
+      'Descritivo. Cada rodada é independente: nenhuma hora é "melhor" de forma repetível. ' +
+      'Diferenças entre horas com poucos sinais são ruído estatístico.';
+
+    if (req.query.formato === 'texto') {
+      const linhas = [
+        `ACERTO POR HORA (Angola) · fonte: ${fonte}`,
+        `Total: ${r.total} sinais · média: ${r.mediaPercent ?? '-'}%`,
+        '',
+        'Hora  Sinais  Acerto  s/Emp   Margem 95%      Leitura'
+      ];
+      for (const h of r.horas) {
+        if (!h.sinais) continue;
+        linhas.push(
+          `${h.hora}   ${String(h.sinais).padStart(5)}  ${String(h.acertoPercent).padStart(5)}%  ${String(h.acertoSemEmpatesPercent ?? '-').padStart(5)}%  ` +
+          `${h.margem95Percent[0]}–${h.margem95Percent[1]}%`.padEnd(15) + '  ' + h.leitura
+        );
+      }
+      linhas.push('', aviso);
+      return res.type('text/plain; charset=utf-8').send(linhas.join('\n'));
+    }
+    res.json({ sucesso: true, fonte, aviso, ...r });
+  } catch (e) {
+    res.status(500).json({ sucesso: false, erro: e.message });
+  }
+});
+
 app.post('/admin/sincronizar', admin, async (_req, res) => res.json(await syncOnce()));
 
 app.post('/admin/telegram-teste', admin, async (_req, res) => {
-  const r = await tgPost(`🎲 <b>CAPUNGA · BAC BO</b>\n✅ Ligação Telegram OK\n🕒 ${hora()}`);
+  const r = await tgPost(`🎲 <b>CAPUNGA · BAC BO</b>\n✅ Ligação Telegram OK\nHora: ${hora()}`);
   res.status(r.ok ? 200 : 502).json({ sucesso: r.ok, erro: R.erroTelegram });
 });
 
