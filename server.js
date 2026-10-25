@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO (Multi-Estratégia)
+ * CAPUNGA DADOS — BAC BO (Multi-Estratégia) — v6.1 (auto-recuperação)
  *
  * Estratégias activas:
  *   1. REPETICAO  — após N da mesma cor, entra na mesma
@@ -11,13 +11,22 @@
  *   5. FORCA      — força da mesa (dominância nos últimos 12)
  *   6. NUMERICA   — scores altos/baixos e diferença de pontos
  *
- * O robô avalia todas e escolhe a melhor oportunidade (maior prioridade).
+ * Novidades v6.1:
+ *   - Catch-up: ao acordar, processa as rodadas perdidas em ordem cronológica
+ *     e resolve o sinal pendente com as rodadas que saíram DEPOIS do sinal
+ *     (não a partir do momento em que o servidor acordou).
+ *   - Expiração do sinal pelo relógio das rodadas (não pelo relógio do servidor).
+ *   - Não cria sinais novos em rodadas antigas (só em rodadas frescas).
+ *   - Keep-alive automático (auto-ping) + sync disparado por qualquer pedido HTTP.
+ *   - Servidor abre a porta primeiro (evita falha de deploy) e tenta de novo se a BD falhar.
+ *   - Dia do placar/limite de reds calculado no fuso de Angola (Africa/Luanda).
  *
  * Env:
  *   DATABASE_URL, BOT_TOKEN, CHAT_ID, ADMIN_TOKEN
  *   SINAIS_ATIVOS=true STREAK_MIN=3 MAX_GALE=2
  *   EMPATE_PROTEGIDO=true MAX_REDS_DIA=10
  *   INTERVALO_MINIMO_MS=40000 SINAL_EXPIRA_MIN=10 INTERVALO_SYNC_MS=8000
+ *   RODADA_FRESCA_SEG=150 KEEPALIVE_MS=600000 SELF_URL=(opcional) PG_SSL=true
  */
 
 const express = require('express');
@@ -35,6 +44,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const SELF_URL = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
 const API_BACBO =
   process.env.API_BACBO ||
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
@@ -57,18 +67,29 @@ const CONFIG = {
   maxRedsDia: intEnv('MAX_REDS_DIA', 10, 1, 50),
   intervaloMinimoMs: intEnv('INTERVALO_MINIMO_MS', 40000, 15000, 3600000),
   sinalExpiraMin: intEnv('SINAL_EXPIRA_MIN', 10, 3, 60),
-  intervaloSyncMs: intEnv('INTERVALO_SYNC_MS', 8000, 5000, 60000)
+  intervaloSyncMs: intEnv('INTERVALO_SYNC_MS', 8000, 5000, 60000),
+  rodadaFrescaMs: intEnv('RODADA_FRESCA_SEG', 150, 30, 900) * 1000,
+  keepAliveMs: intEnv('KEEPALIVE_MS', 600000, 60000, 840000)
 };
+
+// Início do dia no fuso de Angola, como timestamptz (corrige o desvio de 1h)
+const INICIO_DIA = `(date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda') AT TIME ZONE 'Africa/Luanda')`;
+
+const usaSSL = !/localhost|127\.0\.0\.1/i.test(DATABASE_URL) && boolEnv(process.env.PG_SSL, true);
 
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
+      ssl: usaSSL ? { rejectUnauthorized: false } : false,
       max: 5,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 15000
     })
   : null;
+
+if (pool) {
+  pool.on('error', (e) => console.error('[POOL]', e.message));
+}
 
 const runtime = {
   iniciadoEm: new Date().toISOString(),
@@ -92,12 +113,15 @@ const runtime = {
   ultimoIdDB: null,
   ciclosSemNovos: 0,
   motivoSemSinal: null,
-  ultimaEstrategia: null
+  ultimaEstrategia: null,
+  rodadasRecuperadas: 0,
+  ultimoKeepAlive: null
 };
 
 let schemaPromise = null;
 let server = null;
 let syncTimer = null;
+let keepAliveTimer = null;
 
 function log(tag, data) {
   console.log(`[${tag}]`, typeof data === 'string' ? data : JSON.stringify(data));
@@ -249,6 +273,8 @@ async function ensureSchema() {
       )
     `);
     await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS estrategia TEXT`);
+    // Hora da rodada que gerou o sinal — base do catch-up após dormir
+    await pool.query(`ALTER TABLE sinais ADD COLUMN IF NOT EXISTS rodada_fim TIMESTAMPTZ`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_estado ON sinais (estado)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_criado ON sinais (criado_em DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sinais_loss_dia ON sinais (criado_em) WHERE estado = 'LOSS'`);
@@ -323,7 +349,7 @@ async function getRecentAll(limit = 40) {
   return result.rows;
 }
 
-/* ========== ESTRATÉGIAS ========== */
+/* ========== ESTRATÉGIAS (inalteradas) ========== */
 
 function streakLen(rows) {
   if (!rows.length) return 0;
@@ -382,10 +408,7 @@ function stratSurf(rows) {
     const expected = i % 2 === 0 ? a : b;
     if (rows[i]?.resultado !== expected) return null;
   }
-  // Próxima esperada = b (porque último foi a, antes b...)
-  // Sequence newest: a, b, a, b → next should be a? Wait:
-  // newest first: [0]=a, [1]=b, [2]=a, [3]=b → pattern is alternating starting with a
-  // Next new result after a should continue alternation → b
+  // Mais recente primeiro: [0]=a, [1]=b, [2]=a, [3]=b → alternância continua → próxima = b
   const cor = b;
   return {
     cor,
@@ -400,12 +423,8 @@ function stratSurf(rows) {
 function stratDoisDois(rows) {
   if (rows.length < 4) return null;
   const r = rows.map((x) => x.resultado);
-  // Padrão completo BBJJ (newest first: J,J,B,B) → próximo tende a B (novo bloco)
-  // ou JJBB (newest: B,B,J,J) → próximo J
-  // Detectar fim de bloco de 2: last 2 same, previous 2 opposite same
+  // Detectar fim de bloco de 2: últimas 2 iguais, anteriores 2 opostas iguais
   if (r[0] === r[1] && r[2] === r[3] && r[0] !== r[2]) {
-    // Completou 2+2. Entrada na cor do bloco mais recente (continuação do ritmo 2-2)
-    // Ou entrada na oposta para novo bloco — usamos continuidade do par recente
     const cor = r[0];
     return {
       cor,
@@ -572,11 +591,13 @@ function detectBestEntry(rows) {
   return candidatos[0];
 }
 
+/* ========== PLACAR / SINAIS ========== */
+
 async function redsToday() {
   const result = await pool.query(`
     SELECT COUNT(*)::int AS total FROM sinais
     WHERE estado = 'LOSS'
-      AND criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+      AND criado_em >= ${INICIO_DIA}
   `);
   return result.rows[0]?.total || 0;
 }
@@ -590,7 +611,7 @@ async function getPlacarDia() {
       COUNT(*) FILTER (WHERE estado = 'LOSS')::int AS loss,
       COALESCE(SUM(empates), 0)::int AS empates
     FROM sinais
-    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+    WHERE criado_em >= ${INICIO_DIA}
       AND estado IN ('GREEN', 'G1', 'G2', 'LOSS')
   `);
   const s = result.rows[0] || { green: 0, g1: 0, g2: 0, loss: 0, empates: 0 };
@@ -599,7 +620,7 @@ async function getPlacarDia() {
   const percent = finalizados > 0 ? Number(((acertos / finalizados) * 100).toFixed(1)) : 100;
   const recent = await pool.query(`
     SELECT estado FROM sinais
-    WHERE criado_em >= date_trunc('day', NOW() AT TIME ZONE 'Africa/Luanda')
+    WHERE criado_em >= ${INICIO_DIA}
       AND estado IN ('GREEN', 'G1', 'G2', 'LOSS')
     ORDER BY criado_em DESC, id DESC LIMIT 50
   `);
@@ -634,13 +655,25 @@ async function getPendingSignal() {
   return result.rows[0] || null;
 }
 
-async function expirePendingSignal(signal) {
+/** Momento (ms) da rodada que gerou o sinal; cai para criado_em em sinais antigos */
+function baseTimeMs(signal) {
+  return new Date(signal.rodada_fim || signal.criado_em).getTime();
+}
+
+/**
+ * Expira o sinal usando o relógio das RODADAS (refMs = fim da rodada em análise),
+ * não o relógio do servidor — assim dormir não cancela sinais pendentes.
+ */
+async function expirePendingSignal(signal, refMs) {
   if (!signal) return false;
-  const age = Date.now() - new Date(signal.criado_em).getTime();
+  const ref = Number.isFinite(refMs) ? refMs : Date.now();
+  const age = ref - baseTimeMs(signal);
   if (age < CONFIG.sinalExpiraMin * 60000) return false;
-  await pool.query(`UPDATE sinais SET estado = 'CANCELADO' WHERE id = $1 AND estado = 'PENDENTE'`, [signal.id]);
-  await telegramSend(['⏰ Sinal expirado', `Sinal #${signal.id}`, `🕒 ${horaAngola()}`].join('\n'));
-  log('SINAL EXPIRADO', { id: signal.id });
+  const upd = await pool.query(`UPDATE sinais SET estado = 'CANCELADO' WHERE id = $1 AND estado = 'PENDENTE'`, [signal.id]);
+  if (upd.rowCount > 0) {
+    await telegramSend(['⏰ Sinal expirado', `Sinal #${signal.id}`, `🕒 ${horaAngola()}`].join('\n'));
+    log('SINAL EXPIRADO', { id: signal.id });
+  }
   return true;
 }
 
@@ -718,12 +751,21 @@ async function maybeCreateSignal(round) {
     return;
   }
 
+  const roundMs = new Date(round.fim).getTime();
+
   const pending = await getPendingSignal();
   if (pending) {
-    if (!(await expirePendingSignal(pending))) {
+    if (!(await expirePendingSignal(pending, roundMs))) {
       runtime.motivoSemSinal = `pendente_#${pending.id}`;
       return;
     }
+  }
+
+  // Catch-up: rodadas antigas (perdidas durante o sono) só alimentam o histórico
+  // e resolvem sinais pendentes — nunca geram sinais novos fora de tempo.
+  if (Date.now() - roundMs > CONFIG.rodadaFrescaMs) {
+    runtime.motivoSemSinal = 'rodada_antiga_catchup';
+    return;
   }
 
   const reds = await redsToday();
@@ -754,9 +796,9 @@ async function maybeCreateSignal(round) {
   }
 
   const result = await pool.query(
-    `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia)
-     VALUES ($1, 'PENDENTE', 0, $2, 0, $3) RETURNING *`,
-    [entry.cor, round.id, entry.estrategia]
+    `INSERT INTO sinais (cor, estado, gale, resultado_id, empates, estrategia, rodada_fim)
+     VALUES ($1, 'PENDENTE', 0, $2, 0, $3, $4) RETURNING *`,
+    [entry.cor, round.id, entry.estrategia, round.fim]
   );
   const signal = result.rows[0];
   runtime.ultimoSinal = { id: signal.id, cor: signal.cor, estado: signal.estado, criado_em: signal.criado_em, estrategia: entry.estrategia };
@@ -771,7 +813,13 @@ async function resolvePending(round) {
   const signal = await getPendingSignal();
   if (!signal) return;
   if (String(signal.resultado_id) === String(round.id)) return;
-  if (await expirePendingSignal(signal)) return;
+
+  const roundMs = new Date(round.fim).getTime();
+
+  // Só conta rodadas que saíram DEPOIS do sinal (momento em que foi gerado)
+  if (Number.isFinite(roundMs) && roundMs <= baseTimeMs(signal)) return;
+
+  if (await expirePendingSignal(signal, roundMs)) return;
 
   if (round.resultado === 'Empate') {
     if (!CONFIG.empateProtegido) return;
@@ -807,7 +855,7 @@ async function resolvePending(round) {
 }
 
 async function syncOnce() {
-  if (!pool) throw new Error('DATABASE_URL não configurada');
+  if (!pool) return { sucesso: false, erro: 'DATABASE_URL não configurada' };
   if (runtime.sincronizacaoEmCurso) return { sucesso: false, ignorada: true };
   runtime.sincronizacaoEmCurso = true;
   try {
@@ -818,27 +866,27 @@ async function syncOnce() {
     const count = await pool.query('SELECT COUNT(*)::int AS total FROM bacbo_resultados');
     const hadHistory = count.rows[0].total > 0;
     const rounds = await fetchRounds();
-    let inserted = 0, duplicates = 0, evaluated = 0, lastNew = null;
+    let inserted = 0, duplicates = 0, evaluated = 0, recovered = 0, lastNew = null;
     for (const round of rounds) {
       const saved = await insertRound(round);
       if (!saved) { duplicates++; continue; }
       inserted++;
       lastNew = round;
+      if (Date.now() - new Date(round.fim).getTime() > CONFIG.rodadaFrescaMs) recovered++;
       if (hadHistory) {
+        // Ordem cronológica: primeiro resolve o sinal pendente com esta rodada,
+        // depois (só se for rodada fresca) avalia novo sinal.
         await resolvePending(round);
         await maybeCreateSignal(round);
         evaluated++;
       }
-    }
-    if (inserted === 0 && hadHistory) {
-      const pending = await getPendingSignal();
-      if (pending) await expirePendingSignal(pending);
     }
     runtime.sincronizacaoInicialConcluida = true;
     runtime.ultimaSincronizacao = new Date().toISOString();
     runtime.duplicadosUltimoCiclo = duplicates;
     runtime.novosUltimoCiclo = inserted;
     runtime.erroSincronizacao = null;
+    if (hadHistory) runtime.rodadasRecuperadas += recovered;
     if (lastNew) {
       runtime.ultimaRodadaNova = new Date().toISOString();
       runtime.ultimoIdNovo = lastNew.id;
@@ -849,6 +897,7 @@ async function syncOnce() {
     const summary = {
       recebidos: rounds.length,
       novosGuardados: inserted,
+      recuperadasAtrasadas: hadHistory ? recovered : 0,
       duplicados: duplicates,
       sinaisAvaliados: evaluated,
       motivoSemSinal: runtime.motivoSemSinal,
@@ -866,6 +915,19 @@ async function syncOnce() {
     runtime.sincronizacaoEmCurso = false;
   }
 }
+
+/* ========== AUTOMAÇÃO / ACORDAR ========== */
+
+// Qualquer pedido HTTP (ex.: ping externo) dispara sync se estiver atrasado
+app.use((req, res, next) => {
+  if (pool && !runtime.sincronizacaoEmCurso) {
+    const ultima = runtime.ultimaSincronizacao ? Date.parse(runtime.ultimaSincronizacao) : 0;
+    if (Date.now() - ultima > CONFIG.intervaloSyncMs * 3) {
+      syncOnce().catch(() => {});
+    }
+  }
+  next();
+});
 
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return res.status(503).json({ sucesso: false, erro: 'ADMIN_TOKEN não configurado' });
@@ -891,6 +953,7 @@ app.get('/health', (req, res) => {
     ultimaSincronizacao: runtime.ultimaSincronizacao,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
+    rodadasRecuperadas: runtime.rodadasRecuperadas,
     motivoSemSinal: runtime.motivoSemSinal,
     ultimaEstrategia: runtime.ultimaEstrategia
   });
@@ -917,9 +980,12 @@ app.get('/diagnostico', async (req, res) => {
     telegramConfigurado: Boolean(BOT_TOKEN && CHAT_ID),
     httpAPI: runtime.ultimoHTTPAPI,
     erroAPI: runtime.ultimoErroAPI,
+    erroSincronizacao: runtime.erroSincronizacao,
     ultimaSincronizacao: runtime.ultimaSincronizacao,
     novosUltimoCiclo: runtime.novosUltimoCiclo,
     ciclosSemNovos: runtime.ciclosSemNovos,
+    rodadasRecuperadas: runtime.rodadasRecuperadas,
+    ultimoKeepAlive: runtime.ultimoKeepAlive,
     motivoSemSinal: runtime.motivoSemSinal,
     ultimoSinal: runtime.ultimoSinal,
     ultimaEstrategia: runtime.ultimaEstrategia,
@@ -1024,25 +1090,59 @@ app.use((req, res) => {
   res.status(404).json({ sucesso: false, erro: 'Rota não encontrada', caminho: req.path });
 });
 
+function startKeepAlive() {
+  if (!SELF_URL) {
+    log('KEEPALIVE', 'SELF_URL/RENDER_EXTERNAL_URL ausente — use um ping externo (UptimeRobot) em /health');
+    return;
+  }
+  const alvo = `${SELF_URL.replace(/\/+$/, '')}/health`;
+  keepAliveTimer = setInterval(async () => {
+    try {
+      await axios.get(alvo, { timeout: 15000 });
+      runtime.ultimoKeepAlive = new Date().toISOString();
+    } catch (e) {
+      console.error('[KEEPALIVE]', e.message);
+    }
+  }, CONFIG.keepAliveMs);
+  if (typeof keepAliveTimer.unref === 'function') keepAliveTimer.unref();
+  log('KEEPALIVE', { alvo, cadaMs: CONFIG.keepAliveMs });
+}
+
 async function start() {
-  if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada no Render');
-  await ensureSchema();
+  // 1) Abre a porta primeiro — o Render só marca o deploy como saudável assim
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log('======================================');
-    console.log('CAPUNGA DADOS — MULTI-ESTRATÉGIA');
+    console.log('CAPUNGA DADOS — MULTI-ESTRATÉGIA v6.1');
     console.log(`Porta: ${PORT} | Angola: ${horaAngola()}`);
     console.log(`Sinais: ${CONFIG.sinaisAtivos} | Streak: ${CONFIG.streakMin} | Gale: ${CONFIG.maxGale}`);
     console.log('Estratégias: REPETICAO QUEBRA SURF DOIS_DOIS FORCA NUMERICA');
     console.log('======================================');
   });
+
+  if (!DATABASE_URL) {
+    console.error('[AVISO] DATABASE_URL não configurada — servidor online mas sem sincronização');
+  }
+
+  // 2) Prepara BD (com nova tentativa automática se falhar)
+  try {
+    await ensureSchema();
+  } catch (e) {
+    console.error('[DB] falha ao preparar tabelas, nova tentativa no próximo ciclo:', e.message);
+  }
+
+  // 3) Catch-up imediato: recupera tudo o que aconteceu enquanto dormia
   const initial = await syncOnce();
   if (!initial.sucesso) console.error('[PRIMEIRA SYNC]', initial.erro);
-  else log('PRIMEIRA SYNC', { recebidos: initial.recebidos, novos: initial.novosGuardados });
+  else log('PRIMEIRA SYNC', { recebidos: initial.recebidos, novos: initial.novosGuardados, recuperadas: initial.recuperadasAtrasadas });
+
+  // 4) Ciclo contínuo
   syncTimer = setInterval(async () => {
     if (runtime.sincronizacaoEmCurso) return;
     try { await syncOnce(); } catch (err) { console.error('[SYNC]', err.message); }
   }, CONFIG.intervaloSyncMs);
-  if (typeof syncTimer.unref === 'function') syncTimer.unref();
+
+  // 5) Keep-alive automático
+  startKeepAlive();
 }
 
 process.on('unhandledRejection', (r) => console.error('[UNHANDLED]', r));
@@ -1050,6 +1150,7 @@ process.on('uncaughtException', (e) => console.error('[UNCAUGHT]', e));
 
 async function shutdown() {
   if (syncTimer) clearInterval(syncTimer);
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
   if (server) await new Promise((r) => server.close(r));
   if (pool) await pool.end();
   process.exit(0);
