@@ -1,7 +1,7 @@
 {
-  "name": "capunga-bacbo",
-  "version": "6.0.0",
-  "description": "Capunga Dados - Bac Bo multi-estrategia",
+  "name": "capunga-bacbo-gale2",
+  "version": "9.0.0",
+  "description": "Capunga Dados - Bac Bo, sinais ate Gale 2 a cada 5 minutos",
   "main": "server.js",
   "private": true,
   "scripts": {
