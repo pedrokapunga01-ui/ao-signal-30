@@ -1,18 +1,17 @@
-{
-  "name": "capunga-bacbo-gale2",
-  "version": "9.0.0",
-  "description": "Capunga Dados - Bac Bo, sinais ate Gale 2 a cada 5 minutos",
-  "main": "server.js",
+ {
+  "name": "capunga-trading-signals",
+  "version": "2.0.0",
   "private": true,
+  "description": "Gerador informativo de sinais para Telegram com estratégia multi-timeframe, limite global de 5 minutos e histórico simulado.",
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js"
   },
   "engines": {
-    "node": "22.x"
+    "node": ">=20"
   },
   "dependencies": {
-    "axios": "^1.7.9",
-    "cors": "^2.8.5",
     "express": "^4.21.2",
     "pg": "^8.13.1"
   }
