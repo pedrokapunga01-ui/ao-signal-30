@@ -16,7 +16,12 @@ const POLL_MS = 5_000;
 const MAX_HOLD_BARS = 12;
 const STOP_ATR = 1.0;
 const TARGET_ATR = 1.5;
-const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, max: 5, idleTimeoutMillis: 30_000 }) : null;
+const pool = DATABASE_URL ? new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30_000,
+}) : null;
 let loopBusy = false;
 let lastSuccessfulCycle = null;
 let lastError = null;
