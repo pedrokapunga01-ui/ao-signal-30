@@ -12,7 +12,9 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 const SYMBOLS = (process.env.SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 const INTERVAL = '5m';
 const BAR_MS = 5 * 60_000;
-const POLL_MS = 5_000;
+const POLL_MS = 15_000;
+const FIVE_MIN_LIMIT = 800;
+const HOURLY_LIMIT = 100;
 const MAX_HOLD_BARS = 12;
 const STOP_ATR = 1.0;
 const TARGET_ATR = 1.5;
@@ -25,6 +27,7 @@ const pool = DATABASE_URL ? new Pool({
 let loopBusy = false;
 let lastSuccessfulCycle = null;
 let lastError = null;
+let binanceBlockedUntil = 0;
 
 if (!pool) throw new Error('DATABASE_URL é obrigatório.');
 if (!BOT_TOKEN || !CHAT_ID) throw new Error('BOT_TOKEN e CHAT_ID são obrigatórios.');
@@ -76,15 +79,23 @@ async function initDb() {
 }
 
 async function fetchMarket(symbol) {
-  const load = async interval => {
-    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=1500`;
+  if (Date.now() < binanceBlockedUntil) throw new Error(`Binance cooldown ativo até ${new Date(binanceBlockedUntil).toISOString()}`);
+  const load = async (interval,limit) => {
+    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
     const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!response.ok) throw new Error(`Binance API HTTP ${response.status} (${symbol}/${interval})`);
+    if (!response.ok) {
+      if (response.status === 418 || response.status === 429) {
+        const retryAfterMs = Number(response.headers.get('retry-after')) * 1000;
+        const fallbackMs = response.status === 418 ? 15 * 60_000 : 60_000;
+        binanceBlockedUntil = Math.max(binanceBlockedUntil, Date.now() + Math.max(fallbackMs, Number.isFinite(retryAfterMs) ? retryAfterMs : 0));
+      }
+      throw new Error(`Binance API HTTP ${response.status} (${symbol}/${interval})`);
+    }
     const rows = await response.json();
     if (!Array.isArray(rows)) throw new Error(`Resposta de candles inválida (${symbol}/${interval})`);
     return rows.map(r => ({ openTime:Number(r[0]), open:Number(r[1]), high:Number(r[2]), low:Number(r[3]), close:Number(r[4]), volume:Number(r[5]), closeTime:Number(r[6]) }));
   };
-  const [bars,hourBars] = await Promise.all([load('5m'),load('1h')]);
+  const [bars,hourBars] = await Promise.all([load('5m',FIVE_MIN_LIMIT),load('1h',HOURLY_LIMIT)]);
   const now = Date.now();
   return { closed:bars.filter(b => b.closeTime < now - 750), hourly:hourBars.filter(b => b.closeTime < now - 750), forming:bars.find(b => b.closeTime >= now - 750) || null };
 }
@@ -234,13 +245,13 @@ async function processSymbol(symbol) {
 }
 
 async function tick() {
-  if (loopBusy) return;
+  if (loopBusy || Date.now() < binanceBlockedUntil) return;
   loopBusy=true;
   try {
     const candidates=[];
     for (const symbol of SYMBOLS) {
       try { const item=await processSymbol(symbol); if (item) candidates.push(item); }
-      catch(error) { lastError=`${symbol}: ${error.message}`; console.error(lastError); }
+      catch(error) { lastError=`${symbol}: ${error.message}`; console.error(lastError); if (Date.now() < binanceBlockedUntil) break; }
     }
     candidates.sort((a,b)=>b.candidate.score-a.candidate.score);
     if (candidates.length) await createSignal(candidates[0].symbol,candidates[0].candidate,candidates[0].forming);
