@@ -15,6 +15,7 @@ const BAR_MS = 5 * 60_000;
 const POLL_MS = 15_000;
 const FIVE_MIN_LIMIT = 800;
 const HOURLY_LIMIT = 100;
+const MARKET_DATA_PROVIDER = 'Bybit Linear USDT perpetuals';
 const MAX_HOLD_BARS = 12;
 const STOP_ATR = 1.0;
 const TARGET_ATR = 1.5;
@@ -27,7 +28,7 @@ const pool = DATABASE_URL ? new Pool({
 let loopBusy = false;
 let lastSuccessfulCycle = null;
 let lastError = null;
-let binanceBlockedUntil = 0;
+let marketDataBlockedUntil = 0;
 
 if (!pool) throw new Error('DATABASE_URL é obrigatório.');
 if (!BOT_TOKEN || !CHAT_ID) throw new Error('BOT_TOKEN e CHAT_ID são obrigatórios.');
@@ -76,26 +77,37 @@ async function initDb() {
     UNIQUE(signal_id,event_key)
   )`);
   await pool.query('CREATE INDEX IF NOT EXISTS telegram_outbox_pending_idx ON telegram_outbox(sent_at,id)');
+  await pool.query("UPDATE signals SET status='CANCELLED',result='CANCELLED',result_reason='SOURCE_SWITCH_TO_BYBIT_UNRESOLVED' WHERE status='ACTIVE' AND strategy NOT LIKE 'BYBIT_LINEAR:%'");
 }
 
 async function fetchMarket(symbol) {
-  if (Date.now() < binanceBlockedUntil) throw new Error(`Binance cooldown ativo até ${new Date(binanceBlockedUntil).toISOString()}`);
+  if (Date.now() < marketDataBlockedUntil) throw new Error(`Bybit cooldown ativo até ${new Date(marketDataBlockedUntil).toISOString()}`);
   const load = async (interval,limit) => {
-    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
+    const params = new URLSearchParams({ category:'linear', symbol, interval, limit:String(limit) });
+    const url = `https://api.bybit.com/v5/market/kline?${params}`;
     const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!response.ok) {
-      if (response.status === 418 || response.status === 429) {
+      if ([403,418,429].includes(response.status)) {
         const retryAfterMs = Number(response.headers.get('retry-after')) * 1000;
-        const fallbackMs = response.status === 418 ? 15 * 60_000 : 60_000;
-        binanceBlockedUntil = Math.max(binanceBlockedUntil, Date.now() + Math.max(fallbackMs, Number.isFinite(retryAfterMs) ? retryAfterMs : 0));
+        const fallbackMs = response.status === 403 || response.status === 418 ? 10 * 60_000 : 60_000;
+        marketDataBlockedUntil = Math.max(marketDataBlockedUntil, Date.now() + Math.max(fallbackMs, Number.isFinite(retryAfterMs) ? retryAfterMs : 0));
       }
-      throw new Error(`Binance API HTTP ${response.status} (${symbol}/${interval})`);
+      throw new Error(`Bybit API HTTP ${response.status} (${symbol}/${interval})`);
     }
-    const rows = await response.json();
+    const payload = await response.json();
+    if (Number(payload.retCode) !== 0) {
+      if (Number(payload.retCode) === 10006) marketDataBlockedUntil = Math.max(marketDataBlockedUntil, Date.now() + 60_000);
+      throw new Error(`Bybit API ${payload.retCode}: ${payload.retMsg || 'erro de mercado'} (${symbol}/${interval})`);
+    }
+    const rows = payload.result?.list;
     if (!Array.isArray(rows)) throw new Error(`Resposta de candles inválida (${symbol}/${interval})`);
-    return rows.map(r => ({ openTime:Number(r[0]), open:Number(r[1]), high:Number(r[2]), low:Number(r[3]), close:Number(r[4]), volume:Number(r[5]), closeTime:Number(r[6]) }));
+    const intervalMs = interval === '5' ? BAR_MS : 60 * 60_000;
+    return rows.map(r => {
+      const openTime=Number(r[0]);
+      return { openTime, open:Number(r[1]), high:Number(r[2]), low:Number(r[3]), close:Number(r[4]), volume:Number(r[5]), closeTime:openTime+intervalMs-1 };
+    }).sort((a,b)=>a.openTime-b.openTime);
   };
-  const [bars,hourBars] = await Promise.all([load('5m',FIVE_MIN_LIMIT),load('1h',HOURLY_LIMIT)]);
+  const [bars,hourBars] = await Promise.all([load('5',FIVE_MIN_LIMIT),load('60',HOURLY_LIMIT)]);
   const now = Date.now();
   return { closed:bars.filter(b => b.closeTime < now - 750), hourly:hourBars.filter(b => b.closeTime < now - 750), forming:bars.find(b => b.closeTime >= now - 750) || null };
 }
@@ -140,18 +152,18 @@ function getCandidate(candles,hourly) {
   if (!long && !short) return null;
   const mid=long?56:44;
   const score=Math.abs(hFast/hSlow-1)*10_000+Math.abs(fast/slow-1)*10_000+Math.max(0,last.volume/avgVol-0.8)*5+(1-Math.abs(rsi-mid)/10);
-  return { side:long?'LONG':'SHORT', candle:last, atr, score, strategy:'tendência 1h EMA20/50 + pullback 5m EMA20/50 + RSI14 + confirmação de candle + volume' };
+  return { side:long?'LONG':'SHORT', candle:last, atr, score, strategy:'BYBIT_LINEAR: tendência 1h EMA20/50 + pullback 5m EMA20/50 + RSI14 + confirmação de candle + volume' };
 }
 
 const fmt = n => Number(n).toLocaleString('en-US',{maximumSignificantDigits:9});
 function signalMessage(symbol,candidate,entry,stop,target) {
   const sideLabel=candidate.side==='LONG'?'COMPRA / LONG':'VENDA / SHORT';
-  return `⚡ CAPUNGA TRADING ⚡\n━━━━━━━━━━━━━━━━━━\n🧪 ALERTA PAPER — ${sideLabel}\n\nAtivo: ${symbol}\nMercado: Binance USDⓈ-M Futures\nTimeframe: 5 minutos\nEntrada simulada: ${fmt(entry)}\nAlvo: ${fmt(target)}\nStop: ${fmt(stop)}\nValidade máxima: 60 minutos\nTentativas: 1 — sem Gale\n\nConfluência: tendência 1h + pullback 5m + RSI + volume.\n\n⛔ Teste histórico preliminar desta regra teve expectativa líquida negativa fora da amostra. Somente para paper testing; não usar dinheiro real nem tratar como recomendação. Execução real pode divergir.`;
+  return `⚡ CAPUNGA TRADING ⚡\n━━━━━━━━━━━━━━━━━━\n🧪 ALERTA PAPER — ${sideLabel}\n\nAtivo: ${symbol}\nMercado de referência: Bybit Linear USDT Perpetual\nTimeframe: 5 minutos\nEntrada simulada: ${fmt(entry)}\nAlvo: ${fmt(target)}\nStop: ${fmt(stop)}\nValidade máxima: 60 minutos\nTentativas: 1 — sem Gale\n\nConfluência: tendência 1h + pullback 5m + RSI + volume.\n\n⛔ Dados da Bybit; não representam a Binance. O backtest preliminar da lógica em candles Binance foi negativo; a versão com Bybit ainda não foi validada. Somente para paper testing; não usar dinheiro real nem tratar como recomendação.`;
 }
 
 function resultMessage(row,result,reason,exit) {
   const title=result==='GREEN'?'✅ GREEN':'❌ LOSS';
-  return `⚡ CAPUNGA TRADING ⚡\n━━━━━━━━━━━━━━━━━━\n${title} — ${row.symbol} ${row.side}\nResultado simulado: ${result}\nMotivo: ${reason}\nSaída de referência: ${fmt(exit)}\nTentativas: 1 — sem Gale\n\nHistórico teórico baseado em candles; não representa execução real.`;
+  return `⚡ CAPUNGA TRADING ⚡\n━━━━━━━━━━━━━━━━━━\n${title} — ${row.symbol} ${row.side}\nMercado de referência: Bybit Linear USDT Perpetual\nResultado simulado: ${result}\nMotivo: ${reason}\nSaída de referência: ${fmt(exit)}\nTentativas: 1 — sem Gale\n\nHistórico teórico baseado em candles; não representa execução real.`;
 }
 
 async function telegram(text) {
@@ -245,13 +257,13 @@ async function processSymbol(symbol) {
 }
 
 async function tick() {
-  if (loopBusy || Date.now() < binanceBlockedUntil) return;
+  if (loopBusy || Date.now() < marketDataBlockedUntil) return;
   loopBusy=true;
   try {
     const candidates=[];
     for (const symbol of SYMBOLS) {
       try { const item=await processSymbol(symbol); if (item) candidates.push(item); }
-      catch(error) { lastError=`${symbol}: ${error.message}`; console.error(lastError); if (Date.now() < binanceBlockedUntil) break; }
+      catch(error) { lastError=`${symbol}: ${error.message}`; console.error(lastError); if (Date.now() < marketDataBlockedUntil) break; }
     }
     candidates.sort((a,b)=>b.candidate.score-a.candidate.score);
     if (candidates.length) await createSignal(candidates[0].symbol,candidates[0].candidate,candidates[0].forming);
@@ -261,14 +273,14 @@ async function tick() {
 }
 
 app.get('/health',async (_req,res)=>{
-  try { await pool.query('SELECT 1'); res.json({status:'ok',product:'Capunga Trading paper signal generator',market:'Binance USDⓈ-M Futures public data',symbols:SYMBOLS,timeframe:INTERVAL,signal_cap:'one per 5m globally; no minimum',validation:'preliminary backtest was negative; paper testing only',last_cycle:lastSuccessfulCycle,last_error:lastError}); }
+  try { await pool.query('SELECT 1'); res.json({status:'ok',product:'Capunga Trading paper signal generator',market:MARKET_DATA_PROVIDER+' public data',symbols:SYMBOLS,timeframe:INTERVAL,signal_cap:'one per 5m globally; no minimum',validation:'preliminary Binance-data backtest was negative; Bybit-source performance is not yet tested; paper testing only',last_cycle:lastSuccessfulCycle,last_error:lastError}); }
   catch { res.status(503).json({status:'degraded',database:'unavailable'}); }
 });
 
 app.get('/stats',requireAdmin,async (_req,res)=>{
   try {
-    const {rows}=await pool.query(`SELECT symbol,COUNT(*)::int AS total,COUNT(*) FILTER(WHERE result='GREEN')::int AS green,COUNT(*) FILTER(WHERE result='LOSS')::int AS loss,COUNT(*) FILTER(WHERE status='ACTIVE')::int AS active,ROUND(100.0*COUNT(*) FILTER(WHERE result='GREEN')/NULLIF(COUNT(*) FILTER(WHERE result IN ('GREEN','LOSS')),0),2) AS observed_green_pct FROM signals GROUP BY symbol ORDER BY symbol`);
-    res.json({notice:'Resultados simulados; custos, funding e diferenças de execução não estão incorporados. A regra preliminar foi negativa fora da amostra.',stats:rows});
+    const {rows}=await pool.query(`SELECT symbol,COUNT(*)::int AS total,COUNT(*) FILTER(WHERE result='GREEN')::int AS green,COUNT(*) FILTER(WHERE result='LOSS')::int AS loss,COUNT(*) FILTER(WHERE status='ACTIVE')::int AS active,COUNT(*) FILTER(WHERE status='CANCELLED')::int AS cancelled,ROUND(100.0*COUNT(*) FILTER(WHERE result='GREEN')/NULLIF(COUNT(*) FILTER(WHERE result IN ('GREEN','LOSS')),0),2) AS observed_green_pct FROM signals GROUP BY symbol ORDER BY symbol`);
+    res.json({notice:'Resultados simulados; sinais abertos da fonte antiga foram cancelados na migração e não contam como green/loss. Custos e funding não estão incorporados; a regra preliminar em Binance foi negativa fora da amostra.',stats:rows});
   } catch { res.status(500).json({error:'Falha ao consultar estatísticas.'}); }
 });
 
@@ -279,6 +291,6 @@ app.get('/history',requireAdmin,async (req,res)=>{
 });
 
 await initDb();
-app.listen(PORT,'0.0.0.0',()=>console.log(`Capunga Trading — gerador ativo; intervalo de decisão 5m; teto global 1 sinal/5m; ativos=${SYMBOLS.join(',')}`));
+app.listen(PORT,'0.0.0.0',()=>console.log(`Capunga Trading — fonte=${MARKET_DATA_PROVIDER}; intervalo de decisão 5m; teto global 1 sinal/5m; ativos=${SYMBOLS.join(',')}`));
 await tick();
 setInterval(tick,POLL_MS);
