@@ -10,13 +10,22 @@ const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID || process.env.TELEGRAM_CHAT_ID;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 const SYMBOLS = (process.env.SYMBOLS || 'BTCUSDT,ETHUSDT,SOLUSDT').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-const INTERVAL = '5m';
-const BAR_MS = 5 * 60_000;
+const INTERVAL = '1m trigger + 5m/1h trend filters';
+const ENTRY_BAR_MS = 60_000;
+const FIVE_MIN_BAR_MS = 5 * 60_000;
 const POLL_MS = 15_000;
-const FIVE_MIN_LIMIT = 800;
+const ENTRY_LIMIT = 800;
+const FIVE_MIN_LIMIT = 200;
 const HOURLY_LIMIT = 100;
 const MARKET_DATA_PROVIDER = 'Bybit Linear USDT perpetuals';
-const MAX_HOLD_BARS = 12;
+const MIN_ADX_1H = 22;
+const MIN_ADX_5M = 18;
+const MIN_EMA_GAP_1H_ATR = 0.25;
+const MIN_EMA_GAP_5M_ATR = 0.10;
+const MIN_EMA_GAP_1M_ATR = 0.05;
+const MIN_RELATIVE_VOLUME = 1.0;
+const MAX_HOLD_BARS = 60;
+const NO_SETUP_HEARTBEAT_MS = 10 * 60_000;
 const STOP_ATR = 1.0;
 const TARGET_ATR = 1.5;
 const pool = DATABASE_URL ? new Pool({
@@ -77,6 +86,10 @@ async function initDb() {
     UNIQUE(signal_id,event_key)
   )`);
   await pool.query('CREATE INDEX IF NOT EXISTS telegram_outbox_pending_idx ON telegram_outbox(sent_at,id)');
+  await pool.query(`CREATE TABLE IF NOT EXISTS bot_state (
+    state_key TEXT PRIMARY KEY,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   await pool.query("UPDATE signals SET status='CANCELLED',result='CANCELLED',result_reason='SOURCE_SWITCH_TO_BYBIT_UNRESOLVED' WHERE status='ACTIVE' AND strategy NOT LIKE 'BYBIT_LINEAR:%'");
 }
 
@@ -101,15 +114,21 @@ async function fetchMarket(symbol) {
     }
     const rows = payload.result?.list;
     if (!Array.isArray(rows)) throw new Error(`Resposta de candles inválida (${symbol}/${interval})`);
-    const intervalMs = interval === '5' ? BAR_MS : 60 * 60_000;
+    const intervalMs = ({'1':ENTRY_BAR_MS,'5':FIVE_MIN_BAR_MS,'60':60 * 60_000})[interval];
+    if (!intervalMs) throw new Error(`Intervalo Bybit não suportado: ${interval}`);
     return rows.map(r => {
       const openTime=Number(r[0]);
       return { openTime, open:Number(r[1]), high:Number(r[2]), low:Number(r[3]), close:Number(r[4]), volume:Number(r[5]), closeTime:openTime+intervalMs-1 };
     }).sort((a,b)=>a.openTime-b.openTime);
   };
-  const [bars,hourBars] = await Promise.all([load('5',FIVE_MIN_LIMIT),load('60',HOURLY_LIMIT)]);
+  const [entryBars,fiveMinBars,hourBars] = await Promise.all([load('1',ENTRY_LIMIT),load('5',FIVE_MIN_LIMIT),load('60',HOURLY_LIMIT)]);
   const now = Date.now();
-  return { closed:bars.filter(b => b.closeTime < now - 750), hourly:hourBars.filter(b => b.closeTime < now - 750), forming:bars.find(b => b.closeTime >= now - 750) || null };
+  return {
+    entry:entryBars.filter(b => b.closeTime < now - 750),
+    fiveMin:fiveMinBars.filter(b => b.closeTime < now - 750),
+    hourly:hourBars.filter(b => b.closeTime < now - 750),
+    forming:entryBars.find(b => b.closeTime >= now - 750) || null,
+  };
 }
 
 function ema(values, period) {
@@ -138,32 +157,70 @@ function calcAtr(candles, period=14) {
   return value;
 }
 
-function getCandidate(candles,hourly) {
-  if (candles.length < 750) return null;
-  if (hourly.length < 55) return null;
-  const closes=candles.map(c=>c.close), hcloses=hourly.map(c=>c.close), last=candles.at(-1);
+function calcAdx(candles, period=14) {
+  if (candles.length < period * 2) return { adx:NaN, plusDi:NaN, minusDi:NaN };
+  const tr=[], plusDm=[], minusDm=[];
+  for (let i=1; i<candles.length; i++) {
+    const up=candles[i].high-candles[i-1].high;
+    const down=candles[i-1].low-candles[i].low;
+    tr.push(Math.max(candles[i].high-candles[i].low,Math.abs(candles[i].high-candles[i-1].close),Math.abs(candles[i].low-candles[i-1].close)));
+    plusDm.push(up>down && up>0 ? up : 0);
+    minusDm.push(down>up && down>0 ? down : 0);
+  }
+  let smoothTr=tr.slice(0,period).reduce((a,b)=>a+b,0);
+  let smoothPlus=plusDm.slice(0,period).reduce((a,b)=>a+b,0);
+  let smoothMinus=minusDm.slice(0,period).reduce((a,b)=>a+b,0);
+  const dx=[];
+  let plusDi=NaN, minusDi=NaN;
+  for (let i=period-1; i<tr.length; i++) {
+    if (i>=period) {
+      smoothTr=smoothTr-smoothTr/period+tr[i];
+      smoothPlus=smoothPlus-smoothPlus/period+plusDm[i];
+      smoothMinus=smoothMinus-smoothMinus/period+minusDm[i];
+    }
+    if (smoothTr<=0) return { adx:NaN, plusDi:NaN, minusDi:NaN };
+    plusDi=100*smoothPlus/smoothTr;
+    minusDi=100*smoothMinus/smoothTr;
+    const diSum=plusDi+minusDi;
+    dx.push(diSum===0 ? 0 : 100*Math.abs(plusDi-minusDi)/diSum);
+  }
+  if (dx.length<period) return { adx:NaN, plusDi, minusDi };
+  let adx=dx.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for (let i=period; i<dx.length; i++) adx=(adx*(period-1)+dx[i])/period;
+  return { adx, plusDi, minusDi };
+}
+
+function getCandidate(entryCandles,fiveMin,hourly) {
+  if (entryCandles.length < 750 || fiveMin.length < 55 || hourly.length < 55) return null;
+  const closes=entryCandles.map(c=>c.close), mcloses=fiveMin.map(c=>c.close), hcloses=hourly.map(c=>c.close);
+  const last=entryCandles.at(-1), mLast=fiveMin.at(-1);
   const hFast=ema(hcloses,20), hSlow=ema(hcloses,50), hLast=hcloses.at(-1);
-  const fast=ema(closes,20), slow=ema(closes,50), rsi=calcRsi(closes,14), atr=calcAtr(candles,14);
-  const volumes=candles.slice(-21,-1).map(c=>c.volume), avgVol=volumes.reduce((a,b)=>a+b,0)/volumes.length;
-  if (![hFast,hSlow,hLast,fast,slow,rsi,atr,avgVol].every(Number.isFinite) || atr<=0 || avgVol<=0) return null;
-  const volumeOkay=last.volume>=avgVol*0.8;
-  const long=hFast>hSlow && hLast>hFast && fast>slow && last.low<=fast+0.20*atr && last.close>fast && rsi>=48 && rsi<=64 && last.close>last.open && volumeOkay;
-  const short=hFast<hSlow && hLast<hFast && fast<slow && last.high>=fast-0.20*atr && last.close<fast && rsi>=36 && rsi<=52 && last.close<last.open && volumeOkay;
+  const mFast=ema(mcloses,20), mSlow=ema(mcloses,50), eFast=ema(closes,20), eSlow=ema(closes,50);
+  const rsi=calcRsi(mcloses,14), entryAtr=calcAtr(entryCandles,14), atr=calcAtr(fiveMin,14), hAtr=calcAtr(hourly,14);
+  const hTrend=calcAdx(hourly,14), mTrend=calcAdx(fiveMin,14);
+  const hFastPrev=ema(hcloses.slice(0,-3),20), mFastPrev=ema(mcloses.slice(0,-3),20), eFastPrev=ema(closes.slice(0,-3),20);
+  const volumes=entryCandles.slice(-21,-1).map(c=>c.volume), avgVol=volumes.reduce((a,b)=>a+b,0)/volumes.length;
+  if (![hFast,hSlow,hLast,mFast,mSlow,eFast,eSlow,rsi,entryAtr,atr,hAtr,avgVol,hFastPrev,mFastPrev,eFastPrev,hTrend.adx,hTrend.plusDi,hTrend.minusDi,mTrend.adx,mTrend.plusDi,mTrend.minusDi].every(Number.isFinite) || entryAtr<=0 || atr<=0 || hAtr<=0 || avgVol<=0) return null;
+  const volumeOkay=last.volume>=avgVol*MIN_RELATIVE_VOLUME;
+  const longTrend=hTrend.adx>=MIN_ADX_1H && mTrend.adx>=MIN_ADX_5M && hTrend.plusDi>hTrend.minusDi && mTrend.plusDi>mTrend.minusDi && hFast>hFastPrev && mFast>mFastPrev && hFast-hSlow>=MIN_EMA_GAP_1H_ATR*hAtr && mFast-mSlow>=MIN_EMA_GAP_5M_ATR*atr;
+  const shortTrend=hTrend.adx>=MIN_ADX_1H && mTrend.adx>=MIN_ADX_5M && hTrend.minusDi>hTrend.plusDi && mTrend.minusDi>mTrend.plusDi && hFast<hFastPrev && mFast<mFastPrev && hSlow-hFast>=MIN_EMA_GAP_1H_ATR*hAtr && mSlow-mFast>=MIN_EMA_GAP_5M_ATR*atr;
+  const long=longTrend && hLast>hFast && mLast.close>mFast && eFast>eSlow && eFast>eFastPrev && eFast-eSlow>=MIN_EMA_GAP_1M_ATR*entryAtr && last.low<=eFast+0.15*entryAtr && last.close>eFast && rsi>=48 && rsi<=64 && last.close>last.open && volumeOkay;
+  const short=shortTrend && hLast<hFast && mLast.close<mFast && eFast<eSlow && eFast<eFastPrev && eSlow-eFast>=MIN_EMA_GAP_1M_ATR*entryAtr && last.high>=eFast-0.15*entryAtr && last.close<eFast && rsi>=36 && rsi<=52 && last.close<last.open && volumeOkay;
   if (!long && !short) return null;
   const mid=long?56:44;
-  const score=Math.abs(hFast/hSlow-1)*10_000+Math.abs(fast/slow-1)*10_000+Math.max(0,last.volume/avgVol-0.8)*5+(1-Math.abs(rsi-mid)/10);
-  return { side:long?'LONG':'SHORT', candle:last, atr, score, strategy:'BYBIT_LINEAR: tendência 1h EMA20/50 + pullback 5m EMA20/50 + RSI14 + confirmação de candle + volume' };
+  const score=Math.abs(hFast/hSlow-1)*10_000+Math.abs(mFast/mSlow-1)*10_000+(hTrend.adx+mTrend.adx)*0.05+Math.max(0,last.volume/avgVol-MIN_RELATIVE_VOLUME)*5+(1-Math.abs(rsi-mid)/10);
+  return { side:long?'LONG':'SHORT', candle:last, atr, score, strategy:'BYBIT_LINEAR: gatilho 1m + regime ADX/DMI e EMA 5m/1h + pullback' };
 }
 
 const fmt = n => Number(n).toLocaleString('en-US',{maximumSignificantDigits:9});
 function signalMessage(symbol,candidate,entry,stop,target) {
-  const sideLabel=candidate.side==='LONG'?'COMPRA / LONG':'VENDA / SHORT';
-  return `⚡ CAPUNGA TRADING ⚡\n━━━━━━━━━━━━━━━━━━\n🧪 ALERTA PAPER — ${sideLabel}\n\nAtivo: ${symbol}\nMercado de referência: Bybit Linear USDT Perpetual\nTimeframe: 5 minutos\nEntrada simulada: ${fmt(entry)}\nAlvo: ${fmt(target)}\nStop: ${fmt(stop)}\nValidade máxima: 60 minutos\nTentativas: 1 — sem Gale\n\nConfluência: tendência 1h + pullback 5m + RSI + volume.\n\n⛔ Dados da Bybit; não representam a Binance. O backtest preliminar da lógica em candles Binance foi negativo; a versão com Bybit ainda não foi validada. Somente para paper testing; não usar dinheiro real nem tratar como recomendação.`;
+  const sideLabel=candidate.side==='LONG'?'🟢 LONG':'🔴 SHORT';
+  return `⚡ CAPUNGA TRADING\n━━━━━━━━━━━━━━\n${sideLabel} · ${symbol}\nEntrada: ${fmt(entry)}\nAlvo: ${fmt(target)}\nStop: ${fmt(stop)}\nJanela: até 60 min · 1 tentativa\nBybit Perp · paper\nSem promessa de acerto; lógica Bybit ainda não validada.`;
 }
 
 function resultMessage(row,result,reason,exit) {
   const title=result==='GREEN'?'✅ GREEN':'❌ LOSS';
-  return `⚡ CAPUNGA TRADING ⚡\n━━━━━━━━━━━━━━━━━━\n${title} — ${row.symbol} ${row.side}\nMercado de referência: Bybit Linear USDT Perpetual\nResultado simulado: ${result}\nMotivo: ${reason}\nSaída de referência: ${fmt(exit)}\nTentativas: 1 — sem Gale\n\nHistórico teórico baseado em candles; não representa execução real.`;
+  return `⚡ CAPUNGA TRADING\n━━━━━━━━━━━━━━\n${title} · ${row.symbol} ${row.side}\nSaída simulada: ${fmt(exit)}\nMotivo: ${reason}\nPaper · Bybit Perp`;
 }
 
 async function telegram(text) {
@@ -187,10 +244,25 @@ async function dispatchOutbox() {
   }
 }
 
+async function maybeSendNoSetupHeartbeat() {
+  const latest=await pool.query("SELECT created_at FROM signals WHERE strategy LIKE 'BYBIT_LINEAR:%' ORDER BY id DESC LIMIT 1");
+  const signalTime=latest.rowCount ? new Date(latest.rows[0].created_at).getTime() : Date.now();
+  if (Date.now()-signalTime<NO_SETUP_HEARTBEAT_MS) return;
+  const prior=await pool.query("SELECT updated_at FROM bot_state WHERE state_key='no_setup_heartbeat'");
+  if (prior.rowCount && Date.now()-new Date(prior.rows[0].updated_at).getTime()<NO_SETUP_HEARTBEAT_MS) return;
+  await pool.query("INSERT INTO bot_state(state_key,updated_at) VALUES('no_setup_heartbeat',NOW()) ON CONFLICT(state_key) DO UPDATE SET updated_at=NOW()");
+  try {
+    await telegram(`⚡ CAPUNGA TRADING\n🔎 Sem entrada válida agora\nFiltros de tendência não alinhados.\nMonitoramento: Bybit · 1m/5m/1h\nPaper · sem ordem automática`);
+  } catch(error) {
+    lastError=`Telegram heartbeat: ${String(error.message).slice(0,300)}`;
+    console.error(lastError);
+  }
+}
+
 async function createSignal(symbol,candidate,formingBar) {
   const c=candidate.candle;
-  const entryTime=c.openTime+BAR_MS;
-  // Do not publish a stale signal if the expected next 5m candle is already gone.
+  const entryTime=c.openTime+ENTRY_BAR_MS;
+  // Não publicar alerta atrasado se o candle de entrada de 1m já tiver passado.
   if (!formingBar || formingBar.openTime!==entryTime) return;
   const entry=formingBar.open;
   const sign=candidate.side==='LONG'?1:-1;
@@ -202,7 +274,7 @@ async function createSignal(symbol,candidate,formingBar) {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock($1)',[64280511]);
     const recent=await client.query("SELECT created_at FROM signals ORDER BY id DESC LIMIT 1");
-    if (recent.rowCount && Date.now()-new Date(recent.rows[0].created_at).getTime()<BAR_MS) { await client.query('ROLLBACK'); return; }
+    if (recent.rowCount && Date.now()-new Date(recent.rows[0].created_at).getTime()<ENTRY_BAR_MS) { await client.query('ROLLBACK'); return; }
     const active=await client.query("SELECT 1 FROM signals WHERE symbol=$1 AND status IN ('WAITING_ENTRY','ACTIVE') LIMIT 1",[symbol]);
     if (active.rowCount) { await client.query('ROLLBACK'); return; }
     const insert=await client.query(`INSERT INTO signals(symbol,side,strategy,signal_candle_ms,reference_price,entry_ms,entry_price,stop_price,target_price,atr,status)
@@ -230,11 +302,11 @@ async function resolveSignals(symbol,candles) {
       if (stopHit) { result='LOSS'; reason=targetHit?'STOP_AND_TARGET_SAME_BAR_STOP_ASSUMED':'STOP'; exit=Number(row.stop_price); }
       else if (targetHit) { result='GREEN'; reason='TARGET'; exit=Number(row.target_price); }
       else {
-        const held=Math.floor((bar.openTime-entryMs)/BAR_MS)+1;
+        const held=Math.floor((bar.openTime-entryMs)/ENTRY_BAR_MS)+1;
         if (held>=MAX_HOLD_BARS) { result='LOSS'; reason='TIME_LIMIT_WITHOUT_TARGET'; exit=bar.close; }
         else continue;
       }
-      const held=Math.floor((bar.openTime-entryMs)/BAR_MS)+1;
+      const held=Math.floor((bar.openTime-entryMs)/ENTRY_BAR_MS)+1;
       const client=await pool.connect();
       try {
         await client.query('BEGIN');
@@ -249,10 +321,10 @@ async function resolveSignals(symbol,candles) {
 }
 
 async function processSymbol(symbol) {
-  const {closed,hourly,forming}=await fetchMarket(symbol);
-  if (closed.length<750 || hourly.length<55) throw new Error(`Dados insuficientes para tendência multi-timeframe (${symbol})`);
-  await resolveSignals(symbol,closed);
-  const candidate=getCandidate(closed,hourly);
+  const {entry,fiveMin,hourly,forming}=await fetchMarket(symbol);
+  if (entry.length<750 || fiveMin.length<55 || hourly.length<55) throw new Error(`Dados insuficientes para análise multi-timeframe (${symbol})`);
+  await resolveSignals(symbol,entry);
+  const candidate=getCandidate(entry,fiveMin,hourly);
   return candidate?{symbol,candidate,forming}:null;
 }
 
@@ -261,19 +333,23 @@ async function tick() {
   loopBusy=true;
   try {
     const candidates=[];
+    let scanHadError=false;
     for (const symbol of SYMBOLS) {
       try { const item=await processSymbol(symbol); if (item) candidates.push(item); }
-      catch(error) { lastError=`${symbol}: ${error.message}`; console.error(lastError); if (Date.now() < marketDataBlockedUntil) break; }
+      catch(error) { scanHadError=true; lastError=`${symbol}: ${error.message}`; console.error(lastError); if (Date.now() < marketDataBlockedUntil) break; }
     }
     candidates.sort((a,b)=>b.candidate.score-a.candidate.score);
     if (candidates.length) await createSignal(candidates[0].symbol,candidates[0].candidate,candidates[0].forming);
     await dispatchOutbox();
-    lastSuccessfulCycle=new Date().toISOString();
+    if (!scanHadError) {
+      await maybeSendNoSetupHeartbeat();
+      lastSuccessfulCycle=new Date().toISOString();
+    }
   } finally { loopBusy=false; }
 }
 
 app.get('/health',async (_req,res)=>{
-  try { await pool.query('SELECT 1'); res.json({status:'ok',product:'Capunga Trading paper signal generator',market:MARKET_DATA_PROVIDER+' public data',symbols:SYMBOLS,timeframe:INTERVAL,signal_cap:'one per 5m globally; no minimum',validation:'preliminary Binance-data backtest was negative; Bybit-source performance is not yet tested; paper testing only',last_cycle:lastSuccessfulCycle,last_error:lastError}); }
+  try { await pool.query('SELECT 1'); res.json({status:'ok',product:'Capunga Trading paper signal generator',market:MARKET_DATA_PROVIDER+' public data',symbols:SYMBOLS,timeframe:INTERVAL,signal_cap:'up to one qualified signal per 1m globally; no minimum',no_setup_status:'sent after 10m without a qualified signal; status is not a trade signal',validation:'preliminary Binance-data backtest was negative; Bybit 1m variant is not validated; paper testing only',last_cycle:lastSuccessfulCycle,last_error:lastError}); }
   catch { res.status(503).json({status:'degraded',database:'unavailable'}); }
 });
 
@@ -291,6 +367,6 @@ app.get('/history',requireAdmin,async (req,res)=>{
 });
 
 await initDb();
-app.listen(PORT,'0.0.0.0',()=>console.log(`Capunga Trading — fonte=${MARKET_DATA_PROVIDER}; intervalo de decisão 5m; teto global 1 sinal/5m; ativos=${SYMBOLS.join(',')}`));
+app.listen(PORT,'0.0.0.0',()=>console.log(`Capunga Trading — fonte=${MARKET_DATA_PROVIDER}; gatilho 1m + filtros 5m/1h; máximo 1 sinal qualificado/min; ativos=${SYMBOLS.join(',')}`));
 await tick();
 setInterval(tick,POLL_MS);
