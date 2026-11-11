@@ -1,10 +1,10 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v20
- * Monitoramento: API do bacboAnalyzer2 (fallback automático TipMiner + Puppeteer)
- * Env obrigatórias: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL
- * Env opcional: ANALYZER_API_URL (URL do serviço bacboAnalyzer2 no Render)
+ * CAPUNGA DADOS — BAC BO · v19.2
+ * Foco: LÓGICA. Sinais apenas em oportunidades reais, com escada de relaxamento.
+ * MONITORAMENTO: Via Proxies CORS (Bypassa o bloqueio de IP do Render).
+ * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT
  */
 
 const fs = require('fs');
@@ -20,22 +20,16 @@ const CHAT_ID = process.env.CHAT_ID || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
 
-// ========== FONTE DE DADOS: API DO BACBOANALYZER2 ==========
-// Substitua o URL abaixo pelo endereço do seu serviço bacboAnalyzer2 no Render
-// OU defina a variável de ambiente ANALYZER_API_URL
-const ANALYZER_API_URL = process.env.ANALYZER_API_URL ||
-  'https://seu-servico-bacbo.onrender.com/api/bacbo-results';
-
 const CFG = {
   ativos: true,
   maxGale: 2,
   maxPending: 1,
   minAmostra: 60,
-  syncMs: 3000,
-  syncFastMs: 1000,
-  minGapMs: 20000,
-  relaxMs: 3 * 60 * 1000,
-  forceSignalMs: 5 * 60 * 1000,
+  syncMs: 3000,          
+  syncFastMs: 1000,      
+  minGapMs: 20000,       
+  relaxMs: 3 * 60 * 1000,     
+  forceSignalMs: 5 * 60 * 1000, 
   minSettledAgeMs: 5000,
   apuraMaxMs: 600000,
   maxHist: 4000,
@@ -62,6 +56,18 @@ const opp = (c) => (c === J ? B : c === B ? J : null);
 const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
 const LOCK_KEY = 727272;
 
+// ========== MONITORAMENTO COM PROXIES CORS ==========
+const EVOLUTION_URL = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
+
+const API_SOURCES = [
+  process.env.API_BACBO,
+  `https://corsproxy.io/?url=${encodeURIComponent(EVOLUTION_URL)}`,
+  `https://api.allorigins.win/raw?url=${encodeURIComponent(EVOLUTION_URL)}`,
+  `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(EVOLUTION_URL)}`,
+  EVOLUTION_URL
+].filter(Boolean);
+// ====================================================
+
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
   try { return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 16); }
@@ -79,8 +85,8 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '20.0',
-  ultimaSync: null, ultimaRodadaNova: null, fonte: 'bacboAnalyzer2',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '19.2',
+  ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
   ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false
@@ -329,7 +335,7 @@ async function checkDailyReset() {
 /* ============================ TEMPLATES SMS ============================ */
 
 function fmtAnalisando() {
-  return [`⚙️ <b>CAPUNGA v20 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
+  return [`⚙️ <b>CAPUNGA v19 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
 }
 
 function fmtSinal(s) {
@@ -389,7 +395,7 @@ function fmtHistorico() {
   ].join('\n');
 }
 
-/* ============================ NORMALIZAÇÃO DE DADOS ============================ */
+/* ============================ NORMALIZAÇÃO ============================ */
 
 function stripAccents(str) {
   return String(str ?? '').normalize('NFD').split('').filter((c) => {
@@ -407,11 +413,6 @@ function normalizeOutcome(v) {
   return null;
 }
 const validMs = (v) => { if (!v) return null; const t = new Date(v).getTime(); return Number.isNaN(t) ? null : t; };
-const numOrNull = (v) => {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
 function extractItems(b) {
   if (Array.isArray(b)) return b;
   if (!b || typeof b !== 'object') return [];
@@ -419,52 +420,65 @@ function extractItems(b) {
     b.data?.results, b.data?.items, b.data?.resultados, b.data?.rounds,
     b.data?.events, b.data?.data].find(Array.isArray) || [];
 }
+const numOrNull = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+function normalizeRound(item) {
+  const d = item?.data || item?.round || item || {};
+  const r = (d.result && typeof d.result === 'object') ? d.result
+    : (item?.result && typeof item.result === 'object') ? item.result : {};
+  const t = validMs(d.settledAt ?? d.endTime ?? d.endedAt ?? d.finishedAt ?? d.fim ?? item?.settledAt ?? item?.fim);
+  const raw = r.outcome ?? r.resultado ?? r.winner ?? d.outcome ?? d.resultado ?? d.winner ??
+    item?.outcome ?? item?.resultado ?? item?.winner ??
+    (typeof d.result === 'string' ? d.result : null) ??
+    (typeof item?.result === 'string' ? item.result : null);
+  const resultado = normalizeOutcome(raw);
+  const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? '').trim();
+  if (!id || !resultado || !t) return null;
+  const pj = numOrNull(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
+  const pb = numOrNull(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
+  return { id, resultado, t, pj, pb };
+}
 
-/* ============================ FONTE DE DADOS: bacboAnalyzer2 ============================ */
-
-// Consome a API do bacboAnalyzer2 que já resolve scraping + fallback (TipMiner + Puppeteer)
-async function fetchRounds() {
-  try {
-    const resp = await axios.get(ANALYZER_API_URL, {
-      timeout: 10000,
-      headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/20.0' }
-    });
-
-    const items = extractItems(resp.data);
-    if (!Array.isArray(items) || items.length === 0) {
-      R.erroAPI = null;
-      return [];
-    }
-
-    const map = new Map();
-    for (const it of items) {
-      const resultado = normalizeOutcome(
-        it.resultado ?? it.outcome ?? it.result ?? it.winner ??
-        it.data?.resultado ?? it.data?.outcome ?? it.data?.result
-      );
-      const t = validMs(
-        it.settledAt ?? it.t ?? it.timestamp ?? it.createdAt ??
-        it.data?.settledAt ?? it.data?.t ?? it.data?.timestamp
-      );
-      const id = String(
-        it.id ?? it.roundId ?? it.round_id ?? it.gameId ??
-        it.data?.id ?? it.data?.roundId ?? ''
-      ).trim();
-
-      if (!id || !resultado || !t) continue;
-
-      const pj = numOrNull(it.pj ?? it.playerScore ?? it.data?.pj ?? it.data?.playerScore);
-      const pb = numOrNull(it.pb ?? it.bankerScore ?? it.data?.pb ?? it.data?.bankerScore);
-
-      map.set(id, { id, resultado, t, pj, pb });
-    }
-
-    R.erroAPI = null;
-    return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-  } catch (e) {
-    R.erroAPI = e.message;
-    throw new Error(`Analyzer API: ${e.message}`);
+async function fetchFrom(url) {
+  const resp = await axios.get(url, {
+    timeout: 10000,
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/19.2' }
+  });
+  
+  // Proxies às vezes retornam texto em vez de JSON
+  let payload = resp.data;
+  if (typeof payload === 'string') {
+    try { payload = JSON.parse(payload); } catch (_) {}
   }
+
+  const map = new Map();
+  for (const it of extractItems(payload)) {
+    const rd = normalizeRound(it);
+    if (rd) map.set(rd.id, rd);
+  }
+  return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+}
+
+async function fetchRounds() {
+  const erros = [];
+  for (let idx = 0; idx < API_SOURCES.length; idx++) {
+    for (let tentativa = 1; tentativa <= 2; tentativa++) {
+      try {
+        const rounds = await fetchFrom(API_SOURCES[idx]);
+        R.fonteAPI = idx;
+        R.erroAPI = null;
+        return rounds;
+      } catch (e) {
+        erros.push(`fonte${idx + 1}: ${e.message}`);
+        if (tentativa < 2) await sleep(500);
+      }
+    }
+  }
+  R.erroAPI = erros.join(' | ');
+  throw new Error(R.erroAPI);
 }
 
 /* ============================ HELPERS ============================ */
@@ -750,7 +764,7 @@ function evalEntry(H, i, cor) {
   for (let k = 1; k <= CFG.maxGale + 1; k++) {
     const idx = i + k;
     if (idx >= H.length) return null;
-    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return false;
+    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return false; 
     if (H[idx].resultado === cor || H[idx].resultado === E) return true;
   }
   return false;
@@ -836,7 +850,7 @@ function maybeSuspend(key) {
   }
 }
 
-/* ============================ ESCADA DE TIERS ============================ */
+/* ============================ TIERS E GATE ============================ */
 
 function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
 function tierAtual() {
@@ -845,8 +859,6 @@ function tierAtual() {
   if (i >= CFG.relaxMs) return 1;
   return 0;
 }
-
-/* ============================ GATE ============================ */
 
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
@@ -979,8 +991,6 @@ async function notificarGale(s, nivel) {
   }
 }
 
-/* ============================ FECHAR ============================ */
-
 async function fecharSinal(s, status, gale) {
   s.status = status;
   s.gale = gale;
@@ -1007,8 +1017,6 @@ async function fecharSinal(s, status, gale) {
   await tgSendRaw(fmtHistorico());
   maybeSuspend(s.key);
 }
-
-/* ============================ APURAÇÃO ============================ */
 
 async function apurar() {
   const now = Date.now();
@@ -1039,8 +1047,6 @@ async function apurar() {
     }
   }
 }
-
-/* ============================ SYNC ADAPTATIVO ============================ */
 
 function currentSyncMs() {
   if (pendentes().length > 0) return CFG.syncFastMs;
@@ -1073,13 +1079,13 @@ async function sync() {
 
     if (newest && Date.now() - newest.t > CFG.staleAlertMs) {
       const mins = Math.floor((Date.now() - newest.t) / 60000);
-      await tgAlert('API', `API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}`);
+      await tgAlert('API', `API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}\nFonte: ${R.fonteAPI + 1}/${API_SOURCES.length}`);
     }
-    if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length });
+    if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI });
   } catch (e) {
     R.erroAPI = e.message;
     log('SYNC ERRO', e.message);
-    await tgAlert('API', `Erro ao consultar bacboAnalyzer:\n<code>${e.message}</code>`);
+    await tgAlert('API', `Erro ao consultar API BACBO:\n<code>${e.message}</code>`);
   }
 }
 
@@ -1132,9 +1138,8 @@ app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
     ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '20.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
-    fonte: 'bacboAnalyzer2', analyzerUrl: ANALYZER_API_URL,
-    tier: R.tier,
+    versao: '19.2', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
     ultimaSync: R.ultimaSync, ultimaRodada: newest ? R.ultimaRodadaNova : null,
@@ -1181,8 +1186,7 @@ async function start() {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '20.0', deployId: DEPLOY_ID, analyzerUrl: ANALYZER_API_URL });
-
+  log('BOOT', { versao: '19.2', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
