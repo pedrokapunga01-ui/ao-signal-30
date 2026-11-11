@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v19.2
- * Foco: LÓGICA. Sinais apenas em oportunidades reais, com escada de relaxamento.
- * MONITORAMENTO: Via Proxies CORS (Bypassa o bloqueio de IP do Render).
- * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT
+ * CAPUNGA DADOS — BAC BO · v19
+ * Foco: LÓGICA. Sinais apenas em oportunidades reais, com escada de relaxamento
+ * (rigoroso -> relaxado -> forçado aos 5min). Sync adaptativo 1s com sinal pendente
+ * (nunca mais perde rodada no gale). Placar diário zera às 00h00 de Angola.
+ * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT, API_BACBO (opcional), API_BACBO_2 (opcional)
  */
 
 const fs = require('fs');
@@ -25,11 +26,11 @@ const CFG = {
   maxGale: 2,
   maxPending: 1,
   minAmostra: 60,
-  syncMs: 3000,          
-  syncFastMs: 1000,      
-  minGapMs: 20000,       
-  relaxMs: 3 * 60 * 1000,     
-  forceSignalMs: 5 * 60 * 1000, 
+  syncMs: 3000,          // polling normal
+  syncFastMs: 1000,      // polling com sinal pendente / mesa quente
+  minGapMs: 20000,       // entre sinais (quando há oportunidade)
+  relaxMs: 3 * 60 * 1000,     // 3min sem sinal -> relaxa os filtros
+  forceSignalMs: 5 * 60 * 1000, // 5min -> pega a MELHOR oportunidade disponível
   minSettledAgeMs: 5000,
   apuraMaxMs: 600000,
   maxHist: 4000,
@@ -41,6 +42,7 @@ const CFG = {
   staleAlertMs: 3 * 60 * 1000,
   alertThrottleMs: 10 * 60 * 1000,
   keepAliveMs: 60000,
+  // Escada de rigor por tier (0=rigoroso, 1=relaxado, 2=oportunidade forçada)
   tiers: [
     { scoreMin: 85, minStratN: 8, liveMin: 0.86 },
     { scoreMin: 81, minStratN: 5, liveMin: 0.80 },
@@ -56,17 +58,11 @@ const opp = (c) => (c === J ? B : c === B ? J : null);
 const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
 const LOCK_KEY = 727272;
 
-// ========== MONITORAMENTO COM PROXIES CORS ==========
-const EVOLUTION_URL = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
-
 const API_SOURCES = [
-  process.env.API_BACBO,
-  `https://corsproxy.io/?url=${encodeURIComponent(EVOLUTION_URL)}`,
-  `https://api.allorigins.win/raw?url=${encodeURIComponent(EVOLUTION_URL)}`,
-  `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(EVOLUTION_URL)}`,
-  EVOLUTION_URL
+  process.env.API_BACBO ||
+    'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie',
+  process.env.API_BACBO_2 || ''
 ].filter(Boolean);
-// ====================================================
 
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
@@ -80,12 +76,14 @@ const S = {
   stats: null, statsAtLen: -1
 };
 
+// Placar DIÁRIO (zera 00h00 Angola = UTC+1)
 const DAILY = { date: '', total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, bestStreak: 0 };
+// Placar GERAL (persistente)
 const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0 };
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '19.2',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '19.0',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -102,6 +100,7 @@ const fmtHora = new Intl.DateTimeFormat('pt-PT', {
   timeZone: 'Africa/Luanda', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
 });
 const hora = (ms = Date.now()) => fmtHora.format(new Date(ms));
+// Meia-noite em Angola (UTC+1, sem horário de verão)
 const luandaDayKey = (ms = Date.now()) => new Date(ms + 3600000).toISOString().slice(0, 10);
 
 const nomeCor = (c) => (c === B ? 'VERMELHO 🔴' : c === J ? 'AZUL 🔵' : 'EMPATE 🟡');
@@ -231,6 +230,7 @@ async function dbLoadState() {
       }
     } catch (_) {}
 
+    // Placar diário persistido
     try {
       const rawD = await dbStateGet('daily_v19');
       if (rawD) Object.assign(DAILY, JSON.parse(rawD));
@@ -293,7 +293,7 @@ async function tgAlert(tag, detalhe) {
   await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n${detalhe}\n⏱ ${hora()}`);
 }
 
-/* ============================ RESET DIÁRIO ============================ */
+/* ============================ RESET DIÁRIO (00h00 ANGOLA) ============================ */
 
 function dailyWins() { return DAILY.green + DAILY.g1 + DAILY.g2 + DAILY.empate + DAILY.eg1 + DAILY.eg2; }
 function dailyTaxa() { return DAILY.total > 0 ? (dailyWins() / DAILY.total) * 100 : 0; }
@@ -332,7 +332,7 @@ async function checkDailyReset() {
   }
 }
 
-/* ============================ TEMPLATES SMS ============================ */
+/* ============================ TEMPLATES SMS (novo estilo v19) ============================ */
 
 function fmtAnalisando() {
   return [`⚙️ <b>CAPUNGA v19 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
@@ -395,8 +395,9 @@ function fmtHistorico() {
   ].join('\n');
 }
 
-/* ============================ NORMALIZAÇÃO ============================ */
+/* ============================ API ============================ */
 
+// Remove acentos SEM regex de caracteres combinantes (evita corrupção de encoding)
 function stripAccents(str) {
   return String(str ?? '').normalize('NFD').split('').filter((c) => {
     const code = c.charCodeAt(0);
@@ -420,6 +421,7 @@ function extractItems(b) {
     b.data?.results, b.data?.items, b.data?.resultados, b.data?.rounds,
     b.data?.events, b.data?.data].find(Array.isArray) || [];
 }
+// null-safe: Number(null) === 0 criaria scores falsos (ex.: Gatilho 0 falso)
 const numOrNull = (v) => {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -445,23 +447,17 @@ function normalizeRound(item) {
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/19.2' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/19.0' }
   });
-  
-  // Proxies às vezes retornam texto em vez de JSON
-  let payload = resp.data;
-  if (typeof payload === 'string') {
-    try { payload = JSON.parse(payload); } catch (_) {}
-  }
-
   const map = new Map();
-  for (const it of extractItems(payload)) {
+  for (const it of extractItems(resp.data)) {
     const rd = normalizeRound(it);
     if (rd) map.set(rd.id, rd);
   }
   return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
 }
 
+// Fallback automático entre fontes: se a primária falhar, tenta a secundária
 async function fetchRounds() {
   const erros = [];
   for (let idx = 0; idx < API_SOURCES.length; idx++) {
@@ -516,6 +512,7 @@ function detectRegime(seq) {
   const label = chop >= 0.65 ? 'errático' : chop <= 0.35 ? 'tendência' : 'neutro';
   return { trend, chop, label };
 }
+// Estratégias de quebra só em mesa errática; de sequência só em tendência
 function regimeFit(cand, regime) {
   const k = cand.key;
   if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.45;
@@ -523,9 +520,10 @@ function regimeFit(cand, regime) {
   return true;
 }
 
-/* ============================ ESTRATÉGIAS ============================ */
+/* ============================ ESTRATÉGIAS (30 — só as com lógica real) ============================ */
 
 const STRATS = [
+  // ---- SEQUÊNCIA (padrões reais de repetição/alternância) ----
   function seqRepeticao({ seq }) {
     const n = streak(seq);
     if (n < 3 || n > 7) return null;
@@ -605,6 +603,7 @@ const STRATS = [
     if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
     return null;
   },
+  // ---- NUMÉRICA (força real dos dados: margens, escores, sequências de pontos) ----
   function numEscada({ seq }) {
     if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
     const [a, b, c] = seq;
@@ -715,6 +714,7 @@ const STRATS = [
     }
     return null;
   },
+  // ---- EMPATE (padrões pós-empate reais) ----
   function numPosEmpate({ rows, seq }) {
     if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
     return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' };
@@ -764,7 +764,7 @@ function evalEntry(H, i, cor) {
   for (let k = 1; k <= CFG.maxGale + 1; k++) {
     const idx = i + k;
     if (idx >= H.length) return null;
-    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return false; 
+    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return false; // gap = entrada expirou (perde)
     if (H[idx].resultado === cor || H[idx].resultado === E) return true;
   }
   return false;
@@ -832,7 +832,7 @@ function confianca(cand, ctx) {
   return Math.max(80, Math.min(95, conf));
 }
 
-/* ============================ SUSPENSÃO ============================ */
+/* ============================ SUSPENSÃO (persistente) ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
@@ -850,7 +850,10 @@ function maybeSuspend(key) {
   }
 }
 
-/* ============================ TIERS E GATE ============================ */
+/* ============================ ESCADA DE OPORTUNIDADES ============================ */
+/* Tier 0 (mesa quente, <3min sem sinal): RIGOROSO — só entrada de alta convicção
+   Tier 1 (3-5min): RELAXADO — filtros cedem um pouco
+   Tier 2 (>5min): FORÇADO — pega a MELHOR oportunidade disponível (nunca aleatória) */
 
 function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
 function tierAtual() {
@@ -859,6 +862,8 @@ function tierAtual() {
   if (i >= CFG.relaxMs) return 1;
   return 0;
 }
+
+/* ============================ GATE ============================ */
 
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
@@ -913,7 +918,7 @@ async function tentarSinal() {
   let cands = runStrategies(rows);
   if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
 
-  if (tier <= 1) cands = cands.filter((c) => regimeFit(c, regime));
+  if (tier <= 1) cands = cands.filter((c) => regimeFit(c, regime)); // tier 2 ignora regime (mas pega o melhor)
 
   cands = cands.filter((c) => {
     if (isSuspended(c.key)) return false;
@@ -941,6 +946,7 @@ async function tentarSinal() {
 
   if (!melhor) { R.ultimoMotivo = 'sem candidato'; return; }
   if (tier <= 1 && melhor.conf < T.scoreMin) { R.ultimoMotivo = `score ${melhor.conf} < ${T.scoreMin} (tier${tier})`; return; }
+  // Tier 2: aceita qualquer confiança >= 80 (a mensagem marca como oportunidade forçada)
 
   const reservedId = S.nextId;
   const sinalPreliminar = {
@@ -991,6 +997,8 @@ async function notificarGale(s, nivel) {
   }
 }
 
+/* ============================ FECHAR ============================ */
+
 async function fecharSinal(s, status, gale) {
   s.status = status;
   s.gale = gale;
@@ -1017,6 +1025,9 @@ async function fecharSinal(s, status, gale) {
   await tgSendRaw(fmtHistorico());
   maybeSuspend(s.key);
 }
+
+/* ============================ APURAÇÃO GALE 2 ============================ */
+/* REGRA: gap > 7min = janela expirada → LOSS imediato (nada de esperar 7-15min) */
 
 async function apurar() {
   const now = Date.now();
@@ -1048,10 +1059,15 @@ async function apurar() {
   }
 }
 
+/* ============================ SYNC ADAPTATIVO ============================ */
+/* FIX do bug "passa uma rodada e não atualiza": o tick roda a CADA 1 SEGUNDO.
+   Quando há sinal pendente ou a mesa está quente, a API é consultada a cada 1s
+   (antes: só a cada 3s, e o gale perdia a janela da rodada). */
+
 function currentSyncMs() {
   if (pendentes().length > 0) return CFG.syncFastMs;
   const last = S.hist[S.hist.length - 1];
-  if (last && Date.now() - last.t < 45000) return CFG.syncFastMs;
+  if (last && Date.now() - last.t < 45000) return CFG.syncFastMs; // mesa quente
   return CFG.syncMs;
 }
 
@@ -1100,7 +1116,7 @@ async function tick() {
       await sync();
       lastSyncAt = Date.now();
     }
-    await apurar();
+    await apurar();    // apura a cada 1s — gale nunca atrasa
     await tentarSinal();
   } catch (e) { log('TICK ERRO', e.message); }
   finally { busy = false; }
@@ -1138,7 +1154,7 @@ app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
     ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '19.2', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '19.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
@@ -1186,7 +1202,7 @@ async function start() {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '19.2', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '19.0', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
@@ -1197,6 +1213,7 @@ async function start() {
   await sync();
   getStats(true);
 
+  // Recupera PENDENTES com a nova regra de gap
   for (const s of S.signals) {
     if (s.status !== 'PENDENTE') continue;
     const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
@@ -1210,6 +1227,7 @@ async function start() {
   }
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
+  // tick a CADA 1 SEGUNDO — sync interno é adaptativo (1s quente / 3s normal)
   tickTimer = setInterval(() => tick().catch(() => {}), 1000);
   keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
   setTimeout(() => tick().catch(() => {}), 1500);
